@@ -20,6 +20,9 @@ type Job struct {
 	CreatedAt   time.Time
 	AvailableAt time.Time
 	Lease       *Lease
+	StartedAt   *time.Time
+	CompletedAt *time.Time
+	Result      json.RawMessage
 }
 
 // New creates a queued job from submitted job data.
