@@ -1,0 +1,11 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "migrations/000001_create_jobs.up.sql"
+    queries: "internal/storage/postgres/queries/jobs.sql"
+    gen:
+      go:
+        package: "generated"
+        out: "internal/storage/postgres/generated"
+        sql_package: "pgx/v5"
+        emit_pointers_for_null_types: true
