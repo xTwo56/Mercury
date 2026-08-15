@@ -17,10 +17,13 @@ type Lease struct {
 	ExpiresAt time.Time
 }
 
-// Claim leases an available queued job to a worker.
+// Claim leases an available queued or retry-scheduled job to a worker.
 func (j *Job) Claim(workerID WorkerID, token LeaseToken, now, expiresAt time.Time) error {
-	if j.State != StateQueued || j.Lease != nil {
-		return errors.New("job is not queued without a lease")
+	if !CanTransition(j.State, StateLeased) || j.Lease != nil {
+		return errors.New("job cannot transition to leased")
+	}
+	if j.RemainingAttempts() == 0 {
+		return errors.New("job has no attempts remaining")
 	}
 	if now.IsZero() {
 		return errors.New("current time must not be zero")

@@ -13,14 +13,15 @@ func TestJobClaim(t *testing.T) {
 	expiresAt := now.Add(5 * time.Minute).In(location)
 
 	tests := []struct {
-		name        string
-		availableAt time.Time
-		workerID    WorkerID
-		token       LeaseToken
-		now         time.Time
-		expiresAt   time.Time
-		claimed     bool
-		wantErr     bool
+		name            string
+		availableAt     time.Time
+		workerID        WorkerID
+		token           LeaseToken
+		now             time.Time
+		expiresAt       time.Time
+		claimed         bool
+		attemptsStarted int
+		wantErr         bool
 	}{
 		{name: "available now", availableAt: now, workerID: WorkerID("worker-1"), token: LeaseToken("token-1"), now: now, expiresAt: expiresAt},
 		{name: "available in past", availableAt: now.Add(-time.Minute), workerID: WorkerID("worker-1"), token: LeaseToken("token-1"), now: now, expiresAt: expiresAt},
@@ -31,11 +32,13 @@ func TestJobClaim(t *testing.T) {
 		{name: "zero current time", availableAt: now, workerID: WorkerID("worker-1"), token: LeaseToken("token-1"), expiresAt: expiresAt, wantErr: true},
 		{name: "expiration equal to now", availableAt: now, workerID: WorkerID("worker-1"), token: LeaseToken("token-1"), now: now, expiresAt: now, wantErr: true},
 		{name: "expiration before now", availableAt: now, workerID: WorkerID("worker-1"), token: LeaseToken("token-1"), now: now, expiresAt: now.Add(-time.Nanosecond), wantErr: true},
+		{name: "exhausted attempts", availableAt: now, workerID: WorkerID("worker-1"), token: LeaseToken("token-1"), now: now, expiresAt: expiresAt, attemptsStarted: 3, wantErr: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			job := newTestJob(t, now.Add(-time.Hour), tt.availableAt)
+			job.AttemptsStarted = tt.attemptsStarted
 			if tt.claimed {
 				if err := job.Claim(WorkerID("worker-1"), LeaseToken("token-1"), now, expiresAt); err != nil {
 					t.Fatalf("initial Claim() error = %v", err)
@@ -56,6 +59,9 @@ func TestJobClaim(t *testing.T) {
 
 			if job.State != StateLeased {
 				t.Errorf("Job.State = %q, want %q", job.State, StateLeased)
+			}
+			if job.AttemptsStarted != before.AttemptsStarted {
+				t.Errorf("Job.AttemptsStarted = %d, want unchanged value %d", job.AttemptsStarted, before.AttemptsStarted)
 			}
 			wantLease := &Lease{WorkerID: tt.workerID, Token: tt.token, ExpiresAt: tt.expiresAt.UTC()}
 			if !reflect.DeepEqual(job.Lease, wantLease) {
@@ -102,7 +108,7 @@ func TestJobValidateLease(t *testing.T) {
 
 func newTestJob(t *testing.T, createdAt, availableAt time.Time) Job {
 	t.Helper()
-	job, err := New(JobID("job-1"), TaskType("test"), json.RawMessage(`{}`), createdAt, availableAt)
+	job, err := New(JobID("job-1"), TaskType("test"), json.RawMessage(`{}`), 3, createdAt, availableAt)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
