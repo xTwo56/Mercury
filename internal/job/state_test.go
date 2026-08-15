@@ -42,12 +42,12 @@ func TestCanTransition(t *testing.T) {
 	}{
 		{name: "queued to leased", from: StateQueued, to: StateLeased, want: true},
 		{name: "leased to running", from: StateLeased, to: StateRunning, want: true},
+		{name: "leased to queued", from: StateLeased, to: StateQueued, want: true},
 		{name: "running to succeeded", from: StateRunning, to: StateSucceeded, want: true},
 		{name: "running to retry scheduled", from: StateRunning, to: StateRetryScheduled, want: true},
 		{name: "running to failed", from: StateRunning, to: StateFailed, want: true},
 		{name: "retry scheduled to leased", from: StateRetryScheduled, to: StateLeased, want: true},
 		{name: "queued to running", from: StateQueued, to: StateRunning, want: false},
-		{name: "leased to queued", from: StateLeased, to: StateQueued, want: false},
 		{name: "running to queued", from: StateRunning, to: StateQueued, want: false},
 		{name: "running to leased", from: StateRunning, to: StateLeased, want: false},
 		{name: "queued to queued", from: StateQueued, to: StateQueued, want: false},

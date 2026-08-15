@@ -66,3 +66,50 @@ func (j Job) ValidateLease(workerID WorkerID, token LeaseToken, now time.Time) e
 	}
 	return nil
 }
+
+// RecoverExpiredLease releases an expired lease and makes the job eligible for
+// execution again when its attempt budget permits.
+func (j *Job) RecoverExpiredLease(now, retryAt time.Time) error {
+	if now.IsZero() {
+		return errors.New("current time must not be zero")
+	}
+	if j.Lease == nil {
+		return errors.New("job has no lease")
+	}
+	if j.State != StateLeased && j.State != StateRunning {
+		return errors.New("job does not have a recoverable lease")
+	}
+	if now.Before(j.Lease.ExpiresAt) {
+		return errors.New("lease has not expired")
+	}
+
+	if j.State == StateLeased {
+		j.Lease = nil
+		j.State = StateQueued
+		j.AvailableAt = now.UTC()
+		return nil
+	}
+
+	retryable := j.RemainingAttempts() > 0
+	if retryable {
+		if retryAt.IsZero() {
+			return errors.New("retry time must not be zero")
+		}
+		if !retryAt.After(now) {
+			return errors.New("retry time must be after recovery time")
+		}
+	}
+
+	failedAt := now.UTC()
+	j.LastError = "lease expired"
+	j.FailedAt = &failedAt
+	j.Lease = nil
+	j.StartedAt = nil
+	if retryable {
+		j.State = StateRetryScheduled
+		j.AvailableAt = retryAt.UTC()
+	} else {
+		j.State = StateFailed
+	}
+	return nil
+}

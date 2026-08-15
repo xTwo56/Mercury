@@ -6,10 +6,10 @@ import "fmt"
 type State string
 
 const (
-	StateQueued         State = "queued"
+	StateQueued         State = "queued" // available to claom rn
 	StateLeased         State = "leased"
 	StateRunning        State = "running"
-	StateRetryScheduled State = "retry_scheduled"
+	StateRetryScheduled State = "retry_scheduled" // will be available to claim after a scheduled time
 	StateSucceeded      State = "succeeded"
 	StateFailed         State = "failed"
 )
@@ -28,6 +28,7 @@ func ParseState(value string) (State, error) {
 func CanTransition(from, to State) bool {
 	return from == StateQueued && to == StateLeased ||
 		from == StateRetryScheduled && to == StateLeased ||
+		from == StateLeased && to == StateQueued ||
 		from == StateLeased && to == StateRunning ||
 		from == StateRunning && to == StateSucceeded ||
 		from == StateRunning && to == StateRetryScheduled ||
