@@ -122,6 +122,53 @@ func (q *Queries) GetJobByID(ctx context.Context, id string) (Job, error) {
 	return i, err
 }
 
+const getJobByIDForUpdate = `-- name: GetJobByIDForUpdate :one
+SELECT
+    id,
+    task_type,
+    payload,
+    state,
+    max_attempts,
+    attempts_started,
+    created_at,
+    available_at,
+    lease_worker_id,
+    lease_token,
+    lease_expires_at,
+    started_at,
+    result,
+    completed_at,
+    last_error,
+    failed_at
+FROM jobs
+WHERE id = $1
+FOR UPDATE
+`
+
+func (q *Queries) GetJobByIDForUpdate(ctx context.Context, id string) (Job, error) {
+	row := q.db.QueryRow(ctx, getJobByIDForUpdate, id)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.TaskType,
+		&i.Payload,
+		&i.State,
+		&i.MaxAttempts,
+		&i.AttemptsStarted,
+		&i.CreatedAt,
+		&i.AvailableAt,
+		&i.LeaseWorkerID,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.StartedAt,
+		&i.Result,
+		&i.CompletedAt,
+		&i.LastError,
+		&i.FailedAt,
+	)
+	return i, err
+}
+
 const getNextClaimableJobForUpdate = `-- name: GetNextClaimableJobForUpdate :one
 SELECT
     id,
@@ -196,6 +243,34 @@ func (q *Queries) LeaseJob(ctx context.Context, arg LeaseJobParams) (int64, erro
 		arg.LeaseWorkerID,
 		arg.LeaseToken,
 		arg.LeaseExpiresAt,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const startJob = `-- name: StartJob :execrows
+UPDATE jobs
+SET state = $1,
+    attempts_started = $2,
+    started_at = $3
+WHERE id = $4
+`
+
+type StartJobParams struct {
+	State           string
+	AttemptsStarted int32
+	StartedAt       pgtype.Timestamptz
+	ID              string
+}
+
+func (q *Queries) StartJob(ctx context.Context, arg StartJobParams) (int64, error) {
+	result, err := q.db.Exec(ctx, startJob,
+		arg.State,
+		arg.AttemptsStarted,
+		arg.StartedAt,
 		arg.ID,
 	)
 	if err != nil {

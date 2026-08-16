@@ -100,18 +100,18 @@ func (r *JobRepository) ClaimNext(ctx context.Context, workerID job.WorkerID, to
 	queries := r.queries.WithTx(tx)
 	row, err := queries.GetNextClaimableJobForUpdate(ctx, timestamptz(now))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job: %w", ErrNoJobAvailable))
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("claim next job: %w", ErrNoJobAvailable))
 	}
 	if err != nil {
-		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job: select candidate: %w", err))
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("claim next job: select candidate: %w", err))
 	}
 
 	claimed, err := jobFromRow(row)
 	if err != nil {
-		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job: decode candidate: %w", err))
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("claim next job: decode candidate: %w", err))
 	}
 	if err := claimed.Claim(workerID, token, now, expiresAt); err != nil {
-		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job %q: validate claim: %w", claimed.ID, err))
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("claim next job %q: validate claim: %w", claimed.ID, err))
 	}
 
 	leaseWorkerID, leaseToken, leaseExpiresAt := nullableLease(claimed.Lease)
@@ -123,20 +123,66 @@ func (r *JobRepository) ClaimNext(ctx context.Context, workerID job.WorkerID, to
 		LeaseExpiresAt: leaseExpiresAt,
 	})
 	if err != nil {
-		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job %q: persist lease: %w", claimed.ID, err))
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("claim next job %q: persist lease: %w", claimed.ID, err))
 	}
 	if rowsAffected != 1 {
-		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job %q: persist lease affected %d rows", claimed.ID, rowsAffected))
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("claim next job %q: persist lease affected %d rows", claimed.ID, rowsAffected))
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job %q: commit transaction: %w", claimed.ID, err))
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("claim next job %q: commit transaction: %w", claimed.ID, err))
 	}
 	return claimed, nil
 }
 
-func rollbackClaim(ctx context.Context, tx pgx.Tx, cause error) error {
+// StartExecution atomically authenticates a lease and transitions its job to running.
+func (r *JobRepository) StartExecution(ctx context.Context, jobID job.JobID, workerID job.WorkerID, token job.LeaseToken, now time.Time) (job.Job, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return job.Job{}, fmt.Errorf("start job %q: begin transaction: %w", jobID, err)
+	}
+
+	queries := r.queries.WithTx(tx)
+	row, err := queries.GetJobByIDForUpdate(ctx, string(jobID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("start job %q: %w", jobID, ErrJobNotFound))
+	}
+	if err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("start job %q: load: %w", jobID, err))
+	}
+
+	started, err := jobFromRow(row)
+	if err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("start job %q: decode: %w", jobID, err))
+	}
+	if err := started.Start(workerID, token, now); err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("start job %q: validate: %w", jobID, err))
+	}
+	attemptsStarted, err := postgresInteger(started.AttemptsStarted)
+	if err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("start job %q: attempts started: %w", jobID, err))
+	}
+
+	rowsAffected, err := queries.StartJob(ctx, generated.StartJobParams{
+		ID:              string(started.ID),
+		State:           string(started.State),
+		AttemptsStarted: attemptsStarted,
+		StartedAt:       nullableTimestamptz(started.StartedAt),
+	})
+	if err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("start job %q: persist: %w", jobID, err))
+	}
+	if rowsAffected != 1 {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("start job %q: persist affected %d rows", jobID, rowsAffected))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("start job %q: commit transaction: %w", jobID, err))
+	}
+	return started, nil
+}
+
+func rollbackTransaction(ctx context.Context, tx pgx.Tx, cause error) error {
 	if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
-		return fmt.Errorf("%w; rollback claim transaction: %w", cause, err)
+		return fmt.Errorf("%w; rollback transaction: %w", cause, err)
 	}
 	return cause
 }

@@ -75,3 +75,32 @@ SET state = sqlc.arg(state),
     lease_token = sqlc.arg(lease_token),
     lease_expires_at = sqlc.arg(lease_expires_at)
 WHERE id = sqlc.arg(id);
+
+-- name: GetJobByIDForUpdate :one
+SELECT
+    id,
+    task_type,
+    payload,
+    state,
+    max_attempts,
+    attempts_started,
+    created_at,
+    available_at,
+    lease_worker_id,
+    lease_token,
+    lease_expires_at,
+    started_at,
+    result,
+    completed_at,
+    last_error,
+    failed_at
+FROM jobs
+WHERE id = sqlc.arg(id)
+FOR UPDATE;
+
+-- name: StartJob :execrows
+UPDATE jobs
+SET state = sqlc.arg(state),
+    attempts_started = sqlc.arg(attempts_started),
+    started_at = sqlc.arg(started_at)
+WHERE id = sqlc.arg(id);

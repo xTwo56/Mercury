@@ -317,6 +317,156 @@ func TestJobRepositoryIntegration(t *testing.T) {
 			t.Errorf("concurrent outcomes = %d successes, %d unavailable; want 1 and 1", successes, unavailable)
 		}
 	})
+
+	startNow := claimNow.Add(time.Minute)
+	startLeaseExpiresAt := startNow.Add(5 * time.Minute)
+	leasableJob := func(id string, state job.State, attemptsStarted, maxAttempts int, leaseExpiresAt time.Time) job.Job {
+		j := integrationJob(id, claimNow.Add(-time.Hour))
+		j.State = state
+		j.AttemptsStarted = attemptsStarted
+		j.MaxAttempts = maxAttempts
+		j.Lease = &job.Lease{
+			WorkerID:  job.WorkerID("worker-1"),
+			Token:     job.LeaseToken("token-1"),
+			ExpiresAt: leaseExpiresAt,
+		}
+		return j
+	}
+
+	t.Run("start execution", func(t *testing.T) {
+		truncateJobs(t)
+		leased := leasableJob("start-success", job.StateLeased, 1, 3, startLeaseExpiresAt)
+		if err := repository.Create(ctx, leased); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		started, err := repository.StartExecution(ctx, leased.ID, job.WorkerID("worker-1"), job.LeaseToken("token-1"), startNow)
+		if err != nil {
+			t.Fatalf("StartExecution() error = %v", err)
+		}
+		if started.State != job.StateRunning {
+			t.Errorf("StartExecution() state = %q, want %q", started.State, job.StateRunning)
+		}
+		if started.AttemptsStarted != leased.AttemptsStarted+1 {
+			t.Errorf("StartExecution() AttemptsStarted = %d, want %d", started.AttemptsStarted, leased.AttemptsStarted+1)
+		}
+		if started.StartedAt == nil || !started.StartedAt.Equal(startNow) || started.StartedAt.Location() != time.UTC {
+			t.Errorf("StartExecution() StartedAt = %v, want UTC %v", started.StartedAt, startNow.UTC())
+		}
+		if !reflect.DeepEqual(started.Lease, normalizedJob(leased).Lease) {
+			t.Errorf("StartExecution() lease = %#v, want preserved lease %#v", started.Lease, leased.Lease)
+		}
+
+		persisted, err := repository.GetByID(ctx, leased.ID)
+		if err != nil {
+			t.Fatalf("GetByID() error = %v", err)
+		}
+		assertJobEqual(t, persisted, normalizedJob(started))
+	})
+
+	t.Run("start missing job", func(t *testing.T) {
+		truncateJobs(t)
+		_, err := repository.StartExecution(ctx, job.JobID("missing"), job.WorkerID("worker-1"), job.LeaseToken("token-1"), startNow)
+		if !errors.Is(err, ErrJobNotFound) {
+			t.Fatalf("StartExecution() error = %v, want ErrJobNotFound", err)
+		}
+	})
+
+	t.Run("rejected starts roll back", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			job      job.Job
+			workerID job.WorkerID
+			token    job.LeaseToken
+			now      time.Time
+		}{
+			{name: "wrong worker", job: leasableJob("start-wrong-worker", job.StateLeased, 0, 3, startLeaseExpiresAt), workerID: job.WorkerID("worker-2"), token: job.LeaseToken("token-1"), now: startNow},
+			{name: "wrong token", job: leasableJob("start-wrong-token", job.StateLeased, 0, 3, startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-2"), now: startNow},
+			{name: "expired lease", job: leasableJob("start-expired", job.StateLeased, 0, 3, startNow.Add(-time.Microsecond)), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: startNow},
+			{name: "exact expiry", job: leasableJob("start-at-expiry", job.StateLeased, 0, 3, startNow), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: startNow},
+			{name: "invalid source state", job: leasableJob("start-running", job.StateRunning, 1, 3, startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: startNow},
+			{name: "exhausted attempts", job: leasableJob("start-exhausted", job.StateLeased, 3, 3, startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: startNow},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				truncateJobs(t)
+				if err := repository.Create(ctx, tt.job); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+
+				if _, err := repository.StartExecution(ctx, tt.job.ID, tt.workerID, tt.token, tt.now); err == nil {
+					t.Fatal("StartExecution() error = nil, want rejection")
+				}
+				persisted, err := repository.GetByID(ctx, tt.job.ID)
+				if err != nil {
+					t.Fatalf("GetByID() error = %v", err)
+				}
+				assertJobEqual(t, persisted, normalizedJob(tt.job))
+			})
+		}
+	})
+
+	t.Run("concurrent duplicate starts", func(t *testing.T) {
+		truncateJobs(t)
+		leased := leasableJob("start-contended", job.StateLeased, 0, 3, startLeaseExpiresAt)
+		if err := repository.Create(ctx, leased); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		secondConn, err := pgx.Connect(ctx, databaseURL)
+		if err != nil {
+			t.Fatalf("connect second starter: %v", err)
+		}
+		defer func() {
+			if err := secondConn.Close(ctx); err != nil {
+				t.Errorf("close second starter connection: %v", err)
+			}
+		}()
+		if _, err := secondConn.Exec(ctx, "SET search_path TO "+qualifiedSchema); err != nil {
+			t.Fatalf("set second starter search path: %v", err)
+		}
+		secondRepository := NewJobRepository(secondConn)
+
+		type startResult struct {
+			job job.Job
+			err error
+		}
+		start := make(chan struct{})
+		results := make(chan startResult, 2)
+		startExecution := func(repository *JobRepository) {
+			<-start
+			started, err := repository.StartExecution(ctx, leased.ID, job.WorkerID("worker-1"), job.LeaseToken("token-1"), startNow)
+			results <- startResult{job: started, err: err}
+		}
+		go startExecution(repository)
+		go startExecution(secondRepository)
+		close(start)
+
+		var successes, rejections int
+		for range 2 {
+			result := <-results
+			if result.err == nil {
+				successes++
+				if result.job.AttemptsStarted != 1 {
+					t.Errorf("successful StartExecution() AttemptsStarted = %d, want 1", result.job.AttemptsStarted)
+				}
+			} else {
+				rejections++
+			}
+		}
+		if successes != 1 || rejections != 1 {
+			t.Errorf("concurrent outcomes = %d successes, %d rejections; want 1 and 1", successes, rejections)
+		}
+
+		persisted, err := repository.GetByID(ctx, leased.ID)
+		if err != nil {
+			t.Fatalf("GetByID() error = %v", err)
+		}
+		if persisted.State != job.StateRunning || persisted.AttemptsStarted != 1 {
+			t.Errorf("persisted state/count = %q/%d, want %q/1", persisted.State, persisted.AttemptsStarted, job.StateRunning)
+		}
+	})
 }
 
 func integrationJob(id string, createdAt time.Time) job.Job {
