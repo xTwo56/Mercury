@@ -18,14 +18,23 @@ import (
 // ErrJobNotFound indicates that no job exists with the requested ID.
 var ErrJobNotFound = errors.New("job not found")
 
+// ErrNoJobAvailable indicates that no job is currently eligible to be claimed.
+var ErrNoJobAvailable = errors.New("no job available")
+
+type transactionalDB interface {
+	generated.DBTX
+	Begin(context.Context) (pgx.Tx, error)
+}
+
 // JobRepository stores and retrieves jobs from PostgreSQL.
 type JobRepository struct {
+	db      transactionalDB
 	queries *generated.Queries
 }
 
 // NewJobRepository creates a job repository backed by db.
-func NewJobRepository(db generated.DBTX) *JobRepository {
-	return &JobRepository{queries: generated.New(db)}
+func NewJobRepository(db transactionalDB) *JobRepository {
+	return &JobRepository{db: db, queries: generated.New(db)}
 }
 
 // Create inserts a job in its current domain state.
@@ -79,6 +88,57 @@ func (r *JobRepository) GetByID(ctx context.Context, id job.JobID) (job.Job, err
 		return job.Job{}, fmt.Errorf("get job %q: %w", id, err)
 	}
 	return j, nil
+}
+
+// ClaimNext atomically leases the earliest currently eligible job.
+func (r *JobRepository) ClaimNext(ctx context.Context, workerID job.WorkerID, token job.LeaseToken, now, expiresAt time.Time) (job.Job, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return job.Job{}, fmt.Errorf("claim next job: begin transaction: %w", err)
+	}
+
+	queries := r.queries.WithTx(tx)
+	row, err := queries.GetNextClaimableJobForUpdate(ctx, timestamptz(now))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job: %w", ErrNoJobAvailable))
+	}
+	if err != nil {
+		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job: select candidate: %w", err))
+	}
+
+	claimed, err := jobFromRow(row)
+	if err != nil {
+		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job: decode candidate: %w", err))
+	}
+	if err := claimed.Claim(workerID, token, now, expiresAt); err != nil {
+		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job %q: validate claim: %w", claimed.ID, err))
+	}
+
+	leaseWorkerID, leaseToken, leaseExpiresAt := nullableLease(claimed.Lease)
+	rowsAffected, err := queries.LeaseJob(ctx, generated.LeaseJobParams{
+		ID:             string(claimed.ID),
+		State:          string(claimed.State),
+		LeaseWorkerID:  leaseWorkerID,
+		LeaseToken:     leaseToken,
+		LeaseExpiresAt: leaseExpiresAt,
+	})
+	if err != nil {
+		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job %q: persist lease: %w", claimed.ID, err))
+	}
+	if rowsAffected != 1 {
+		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job %q: persist lease affected %d rows", claimed.ID, rowsAffected))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return job.Job{}, rollbackClaim(ctx, tx, fmt.Errorf("claim next job %q: commit transaction: %w", claimed.ID, err))
+	}
+	return claimed, nil
+}
+
+func rollbackClaim(ctx context.Context, tx pgx.Tx, cause error) error {
+	if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		return fmt.Errorf("%w; rollback claim transaction: %w", cause, err)
+	}
+	return cause
 }
 
 func jobFromRow(row generated.Job) (job.Job, error) {

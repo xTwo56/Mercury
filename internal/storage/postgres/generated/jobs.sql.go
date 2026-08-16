@@ -121,3 +121,85 @@ func (q *Queries) GetJobByID(ctx context.Context, id string) (Job, error) {
 	)
 	return i, err
 }
+
+const getNextClaimableJobForUpdate = `-- name: GetNextClaimableJobForUpdate :one
+SELECT
+    id,
+    task_type,
+    payload,
+    state,
+    max_attempts,
+    attempts_started,
+    created_at,
+    available_at,
+    lease_worker_id,
+    lease_token,
+    lease_expires_at,
+    started_at,
+    result,
+    completed_at,
+    last_error,
+    failed_at
+FROM jobs
+WHERE state IN ('queued', 'retry_scheduled')
+  AND available_at <= $1
+  AND attempts_started < max_attempts
+ORDER BY available_at, created_at, id
+LIMIT 1
+FOR UPDATE SKIP LOCKED
+`
+
+func (q *Queries) GetNextClaimableJobForUpdate(ctx context.Context, now pgtype.Timestamptz) (Job, error) {
+	row := q.db.QueryRow(ctx, getNextClaimableJobForUpdate, now)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.TaskType,
+		&i.Payload,
+		&i.State,
+		&i.MaxAttempts,
+		&i.AttemptsStarted,
+		&i.CreatedAt,
+		&i.AvailableAt,
+		&i.LeaseWorkerID,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.StartedAt,
+		&i.Result,
+		&i.CompletedAt,
+		&i.LastError,
+		&i.FailedAt,
+	)
+	return i, err
+}
+
+const leaseJob = `-- name: LeaseJob :execrows
+UPDATE jobs
+SET state = $1,
+    lease_worker_id = $2,
+    lease_token = $3,
+    lease_expires_at = $4
+WHERE id = $5
+`
+
+type LeaseJobParams struct {
+	State          string
+	LeaseWorkerID  *string
+	LeaseToken     *string
+	LeaseExpiresAt pgtype.Timestamptz
+	ID             string
+}
+
+func (q *Queries) LeaseJob(ctx context.Context, arg LeaseJobParams) (int64, error) {
+	result, err := q.db.Exec(ctx, leaseJob,
+		arg.State,
+		arg.LeaseWorkerID,
+		arg.LeaseToken,
+		arg.LeaseExpiresAt,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}

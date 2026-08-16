@@ -147,6 +147,176 @@ func TestJobRepositoryIntegration(t *testing.T) {
 			t.Fatal("second Create() error = nil, want duplicate-key error")
 		}
 	})
+
+	truncateJobs := func(t *testing.T) {
+		t.Helper()
+		if _, err := conn.Exec(ctx, "TRUNCATE jobs"); err != nil {
+			t.Fatalf("truncate jobs: %v", err)
+		}
+	}
+	claimNow := createdAt.Add(time.Hour)
+	claimExpiresAt := claimNow.Add(5 * time.Minute)
+
+	t.Run("claim next", func(t *testing.T) {
+		truncateJobs(t)
+		later := integrationJob("claim-later", claimNow.Add(-10*time.Minute))
+		later.AvailableAt = claimNow.Add(-time.Minute)
+		earliest := integrationJob("claim-earliest", claimNow.Add(-20*time.Minute))
+		earliest.AvailableAt = claimNow.Add(-2 * time.Minute)
+		for _, j := range []job.Job{later, earliest} {
+			if err := repository.Create(ctx, j); err != nil {
+				t.Fatalf("Create(%q) error = %v", j.ID, err)
+			}
+		}
+
+		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt)
+		if err != nil {
+			t.Fatalf("ClaimNext() error = %v", err)
+		}
+		if claimed.ID != earliest.ID {
+			t.Errorf("ClaimNext() ID = %q, want %q", claimed.ID, earliest.ID)
+		}
+		if claimed.State != job.StateLeased || claimed.Lease == nil {
+			t.Fatalf("ClaimNext() state/lease = %q/%#v, want leased job", claimed.State, claimed.Lease)
+		}
+		if claimed.Lease.WorkerID != job.WorkerID("worker-1") || claimed.Lease.Token != job.LeaseToken("token-1") || !claimed.Lease.ExpiresAt.Equal(claimExpiresAt) {
+			t.Errorf("ClaimNext() lease = %#v, want supplied lease values", claimed.Lease)
+		}
+		if claimed.AttemptsStarted != 0 {
+			t.Errorf("ClaimNext() AttemptsStarted = %d, want 0", claimed.AttemptsStarted)
+		}
+
+		persisted, err := repository.GetByID(ctx, claimed.ID)
+		if err != nil {
+			t.Fatalf("GetByID() error = %v", err)
+		}
+		assertJobEqual(t, persisted, normalizedJob(claimed))
+	})
+
+	t.Run("claim retry scheduled job", func(t *testing.T) {
+		truncateJobs(t)
+		j := integrationJob("retry-ready", claimNow.Add(-time.Hour))
+		j.State = job.StateRetryScheduled
+		j.AvailableAt = claimNow
+		j.AttemptsStarted = 1
+		if err := repository.Create(ctx, j); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt)
+		if err != nil {
+			t.Fatalf("ClaimNext() error = %v", err)
+		}
+		if claimed.ID != j.ID || claimed.State != job.StateLeased || claimed.AttemptsStarted != j.AttemptsStarted {
+			t.Errorf("ClaimNext() job = %#v, want retry job leased without consuming an attempt", claimed)
+		}
+	})
+
+	t.Run("skip future job", func(t *testing.T) {
+		truncateJobs(t)
+		future := integrationJob("future", claimNow)
+		future.AvailableAt = claimNow.Add(time.Minute)
+		ready := integrationJob("ready", claimNow.Add(-time.Minute))
+		ready.AvailableAt = claimNow
+		for _, j := range []job.Job{future, ready} {
+			if err := repository.Create(ctx, j); err != nil {
+				t.Fatalf("Create(%q) error = %v", j.ID, err)
+			}
+		}
+
+		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt)
+		if err != nil {
+			t.Fatalf("ClaimNext() error = %v", err)
+		}
+		if claimed.ID != ready.ID {
+			t.Errorf("ClaimNext() ID = %q, want %q", claimed.ID, ready.ID)
+		}
+	})
+
+	t.Run("skip non-claimable state", func(t *testing.T) {
+		truncateJobs(t)
+		terminal := integrationJob("succeeded", claimNow.Add(-time.Hour))
+		terminal.State = job.StateSucceeded
+		terminal.AttemptsStarted = 1
+		ready := integrationJob("queued", claimNow.Add(-time.Minute))
+		for _, j := range []job.Job{terminal, ready} {
+			if err := repository.Create(ctx, j); err != nil {
+				t.Fatalf("Create(%q) error = %v", j.ID, err)
+			}
+		}
+
+		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt)
+		if err != nil {
+			t.Fatalf("ClaimNext() error = %v", err)
+		}
+		if claimed.ID != ready.ID {
+			t.Errorf("ClaimNext() ID = %q, want %q", claimed.ID, ready.ID)
+		}
+	})
+
+	t.Run("empty queue", func(t *testing.T) {
+		truncateJobs(t)
+		_, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt)
+		if !errors.Is(err, ErrNoJobAvailable) {
+			t.Fatalf("ClaimNext() error = %v, want ErrNoJobAvailable", err)
+		}
+	})
+
+	t.Run("concurrent workers claim one job", func(t *testing.T) {
+		truncateJobs(t)
+		j := integrationJob("contended", claimNow.Add(-time.Minute))
+		if err := repository.Create(ctx, j); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		secondConn, err := pgx.Connect(ctx, databaseURL)
+		if err != nil {
+			t.Fatalf("connect second worker: %v", err)
+		}
+		defer func() {
+			if err := secondConn.Close(ctx); err != nil {
+				t.Errorf("close second worker connection: %v", err)
+			}
+		}()
+		if _, err := secondConn.Exec(ctx, "SET search_path TO "+qualifiedSchema); err != nil {
+			t.Fatalf("set second worker search path: %v", err)
+		}
+		secondRepository := NewJobRepository(secondConn)
+
+		type claimResult struct {
+			job job.Job
+			err error
+		}
+		start := make(chan struct{})
+		results := make(chan claimResult, 2)
+		claim := func(repository *JobRepository, workerID job.WorkerID, token job.LeaseToken) {
+			<-start
+			claimed, err := repository.ClaimNext(ctx, workerID, token, claimNow, claimExpiresAt)
+			results <- claimResult{job: claimed, err: err}
+		}
+		go claim(repository, job.WorkerID("worker-1"), job.LeaseToken("token-1"))
+		go claim(secondRepository, job.WorkerID("worker-2"), job.LeaseToken("token-2"))
+		close(start)
+
+		var successes, unavailable int
+		for range 2 {
+			result := <-results
+			switch {
+			case result.err == nil:
+				successes++
+				if result.job.ID != j.ID {
+					t.Errorf("ClaimNext() ID = %q, want %q", result.job.ID, j.ID)
+				}
+			case errors.Is(result.err, ErrNoJobAvailable):
+				unavailable++
+			default:
+				t.Errorf("ClaimNext() unexpected error = %v", result.err)
+			}
+		}
+		if successes != 1 || unavailable != 1 {
+			t.Errorf("concurrent outcomes = %d successes, %d unavailable; want 1 and 1", successes, unavailable)
+		}
+	})
 }
 
 func integrationJob(id string, createdAt time.Time) job.Job {
