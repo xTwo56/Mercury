@@ -467,6 +467,149 @@ func TestJobRepositoryIntegration(t *testing.T) {
 			t.Errorf("persisted state/count = %q/%d, want %q/1", persisted.State, persisted.AttemptsStarted, job.StateRunning)
 		}
 	})
+
+	renewNow := startNow.Add(time.Minute)
+	renewedExpiresAt := startLeaseExpiresAt.Add(5 * time.Minute)
+	runningLeasedJob := func(id string, leaseExpiresAt time.Time) job.Job {
+		j := leasableJob(id, job.StateRunning, 1, 3, leaseExpiresAt)
+		startedAt := startNow
+		j.StartedAt = &startedAt
+		return j
+	}
+
+	t.Run("renew lease", func(t *testing.T) {
+		truncateJobs(t)
+		running := runningLeasedJob("renew-success", startLeaseExpiresAt)
+		if err := repository.Create(ctx, running); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		renewed, err := repository.RenewLease(ctx, running.ID, job.WorkerID("worker-1"), job.LeaseToken("token-1"), renewNow, renewedExpiresAt)
+		if err != nil {
+			t.Fatalf("RenewLease() error = %v", err)
+		}
+		want := normalizedJob(running)
+		want.Lease.ExpiresAt = renewedExpiresAt.UTC()
+		assertJobEqual(t, renewed, want)
+		if renewed.Lease.ExpiresAt.Location() != time.UTC {
+			t.Errorf("RenewLease() expiration location = %v, want UTC", renewed.Lease.ExpiresAt.Location())
+		}
+
+		persisted, err := repository.GetByID(ctx, running.ID)
+		if err != nil {
+			t.Fatalf("GetByID() error = %v", err)
+		}
+		assertJobEqual(t, persisted, want)
+	})
+
+	t.Run("renew missing job lease", func(t *testing.T) {
+		truncateJobs(t)
+		_, err := repository.RenewLease(ctx, job.JobID("missing"), job.WorkerID("worker-1"), job.LeaseToken("token-1"), renewNow, renewedExpiresAt)
+		if !errors.Is(err, ErrJobNotFound) {
+			t.Fatalf("RenewLease() error = %v, want ErrJobNotFound", err)
+		}
+	})
+
+	t.Run("rejected renewals roll back", func(t *testing.T) {
+		zeroTime := time.Time{}
+		tests := []struct {
+			name         string
+			job          job.Job
+			workerID     job.WorkerID
+			token        job.LeaseToken
+			now          time.Time
+			newExpiresAt time.Time
+		}{
+			{name: "non-running state", job: leasableJob("renew-leased", job.StateLeased, 0, 3, startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: renewNow, newExpiresAt: renewedExpiresAt},
+			{name: "wrong worker", job: runningLeasedJob("renew-wrong-worker", startLeaseExpiresAt), workerID: job.WorkerID("worker-2"), token: job.LeaseToken("token-1"), now: renewNow, newExpiresAt: renewedExpiresAt},
+			{name: "wrong token", job: runningLeasedJob("renew-wrong-token", startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-2"), now: renewNow, newExpiresAt: renewedExpiresAt},
+			{name: "expired lease", job: runningLeasedJob("renew-expired", renewNow.Add(-time.Microsecond)), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: renewNow, newExpiresAt: renewedExpiresAt},
+			{name: "exact expiry", job: runningLeasedJob("renew-at-expiry", renewNow), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: renewNow, newExpiresAt: renewedExpiresAt},
+			{name: "zero current time", job: runningLeasedJob("renew-zero-now", startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: zeroTime, newExpiresAt: renewedExpiresAt},
+			{name: "zero new expiration", job: runningLeasedJob("renew-zero-expiration", startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: renewNow, newExpiresAt: zeroTime},
+			{name: "expiration equal to now", job: runningLeasedJob("renew-equal-now", startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: renewNow, newExpiresAt: renewNow},
+			{name: "expiration before now", job: runningLeasedJob("renew-before-now", startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: renewNow, newExpiresAt: renewNow.Add(-time.Microsecond)},
+			{name: "retain expiration", job: runningLeasedJob("renew-retain", startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: renewNow, newExpiresAt: startLeaseExpiresAt},
+			{name: "shorten expiration", job: runningLeasedJob("renew-shorten", startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: renewNow, newExpiresAt: startLeaseExpiresAt.Add(-time.Microsecond)},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				truncateJobs(t)
+				if err := repository.Create(ctx, tt.job); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+
+				if _, err := repository.RenewLease(ctx, tt.job.ID, tt.workerID, tt.token, tt.now, tt.newExpiresAt); err == nil {
+					t.Fatal("RenewLease() error = nil, want rejection")
+				}
+				persisted, err := repository.GetByID(ctx, tt.job.ID)
+				if err != nil {
+					t.Fatalf("GetByID() error = %v", err)
+				}
+				assertJobEqual(t, persisted, normalizedJob(tt.job))
+			})
+		}
+	})
+
+	t.Run("concurrent lease renewals never shorten or change ownership", func(t *testing.T) {
+		truncateJobs(t)
+		running := runningLeasedJob("renew-contended", startLeaseExpiresAt)
+		if err := repository.Create(ctx, running); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		secondConn, err := pgx.Connect(ctx, databaseURL)
+		if err != nil {
+			t.Fatalf("connect second heartbeat: %v", err)
+		}
+		defer func() {
+			if err := secondConn.Close(ctx); err != nil {
+				t.Errorf("close second heartbeat connection: %v", err)
+			}
+		}()
+		if _, err := secondConn.Exec(ctx, "SET search_path TO "+qualifiedSchema); err != nil {
+			t.Fatalf("set second heartbeat search path: %v", err)
+		}
+		secondRepository := NewJobRepository(secondConn)
+
+		shorterExtension := startLeaseExpiresAt.Add(5 * time.Minute)
+		longerExtension := startLeaseExpiresAt.Add(10 * time.Minute)
+		start := make(chan struct{})
+		results := make(chan error, 2)
+		renew := func(repository *JobRepository, expiration time.Time) {
+			<-start
+			_, err := repository.RenewLease(ctx, running.ID, job.WorkerID("worker-1"), job.LeaseToken("token-1"), renewNow, expiration)
+			results <- err
+		}
+		go renew(repository, shorterExtension)
+		go renew(secondRepository, longerExtension)
+		close(start)
+
+		var successes int
+		for range 2 {
+			if err := <-results; err == nil {
+				successes++
+			}
+		}
+		if successes < 1 {
+			t.Fatal("concurrent RenewLease() calls both failed, want at least the longest extension to succeed")
+		}
+
+		persisted, err := repository.GetByID(ctx, running.ID)
+		if err != nil {
+			t.Fatalf("GetByID() error = %v", err)
+		}
+		if !persisted.Lease.ExpiresAt.Equal(longerExtension) {
+			t.Errorf("persisted expiration = %v, want longest extension %v", persisted.Lease.ExpiresAt, longerExtension)
+		}
+		if persisted.Lease.WorkerID != running.Lease.WorkerID || persisted.Lease.Token != running.Lease.Token {
+			t.Errorf("persisted owner/token = %q/%q, want %q/%q", persisted.Lease.WorkerID, persisted.Lease.Token, running.Lease.WorkerID, running.Lease.Token)
+		}
+		if persisted.State != running.State || persisted.AttemptsStarted != running.AttemptsStarted || !reflect.DeepEqual(persisted.StartedAt, normalizedJob(running).StartedAt) {
+			t.Errorf("renewal changed execution fields: got state/count/start %q/%d/%v", persisted.State, persisted.AttemptsStarted, persisted.StartedAt)
+		}
+	})
 }
 
 func integrationJob(id string, createdAt time.Time) job.Job {

@@ -76,6 +76,11 @@ SET state = sqlc.arg(state),
     lease_expires_at = sqlc.arg(lease_expires_at)
 WHERE id = sqlc.arg(id);
 
+-- name: RenewJobLease :execrows
+UPDATE jobs
+SET lease_expires_at = sqlc.arg(lease_expires_at)
+WHERE id = sqlc.arg(id);
+
 -- name: GetJobByIDForUpdate :one
 SELECT
     id,

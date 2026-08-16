@@ -251,6 +251,25 @@ func (q *Queries) LeaseJob(ctx context.Context, arg LeaseJobParams) (int64, erro
 	return result.RowsAffected(), nil
 }
 
+const renewJobLease = `-- name: RenewJobLease :execrows
+UPDATE jobs
+SET lease_expires_at = $1
+WHERE id = $2
+`
+
+type RenewJobLeaseParams struct {
+	LeaseExpiresAt pgtype.Timestamptz
+	ID             string
+}
+
+func (q *Queries) RenewJobLease(ctx context.Context, arg RenewJobLeaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, renewJobLease, arg.LeaseExpiresAt, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const startJob = `-- name: StartJob :execrows
 UPDATE jobs
 SET state = $1,
