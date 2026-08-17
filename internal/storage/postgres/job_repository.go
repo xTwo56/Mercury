@@ -220,6 +220,48 @@ func (r *JobRepository) RenewLease(ctx context.Context, jobID job.JobID, workerI
 	return renewed, nil
 }
 
+// CompleteExecution atomically authenticates and completes a running job.
+func (r *JobRepository) CompleteExecution(ctx context.Context, jobID job.JobID, workerID job.WorkerID, token job.LeaseToken, result json.RawMessage, now time.Time) (job.Job, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return job.Job{}, fmt.Errorf("complete job %q: begin transaction: %w", jobID, err)
+	}
+
+	queries := r.queries.WithTx(tx)
+	row, err := queries.GetJobByIDForUpdate(ctx, string(jobID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("complete job %q: %w", jobID, ErrJobNotFound))
+	}
+	if err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("complete job %q: load: %w", jobID, err))
+	}
+
+	completed, err := jobFromRow(row)
+	if err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("complete job %q: decode: %w", jobID, err))
+	}
+	if err := completed.Complete(workerID, token, now, result); err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("complete job %q: validate: %w", jobID, err))
+	}
+
+	rowsAffected, err := queries.CompleteJob(ctx, generated.CompleteJobParams{
+		ID:          string(completed.ID),
+		State:       string(completed.State),
+		Result:      nullableJSON(completed.Result),
+		CompletedAt: nullableTimestamptz(completed.CompletedAt),
+	})
+	if err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("complete job %q: persist: %w", jobID, err))
+	}
+	if rowsAffected != 1 {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("complete job %q: persist affected %d rows", jobID, rowsAffected))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("complete job %q: commit transaction: %w", jobID, err))
+	}
+	return completed, nil
+}
+
 func rollbackTransaction(ctx context.Context, tx pgx.Tx, cause error) error {
 	if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
 		return fmt.Errorf("%w; rollback transaction: %w", cause, err)

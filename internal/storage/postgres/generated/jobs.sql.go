@@ -11,6 +11,37 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const completeJob = `-- name: CompleteJob :execrows
+UPDATE jobs
+SET state = $1,
+    result = $2,
+    completed_at = $3,
+    lease_worker_id = NULL,
+    lease_token = NULL,
+    lease_expires_at = NULL
+WHERE id = $4
+`
+
+type CompleteJobParams struct {
+	State       string
+	Result      []byte
+	CompletedAt pgtype.Timestamptz
+	ID          string
+}
+
+func (q *Queries) CompleteJob(ctx context.Context, arg CompleteJobParams) (int64, error) {
+	result, err := q.db.Exec(ctx, completeJob,
+		arg.State,
+		arg.Result,
+		arg.CompletedAt,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const createJob = `-- name: CreateJob :exec
 INSERT INTO jobs (
     id,

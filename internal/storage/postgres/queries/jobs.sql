@@ -109,3 +109,13 @@ SET state = sqlc.arg(state),
     attempts_started = sqlc.arg(attempts_started),
     started_at = sqlc.arg(started_at)
 WHERE id = sqlc.arg(id);
+
+-- name: CompleteJob :execrows
+UPDATE jobs
+SET state = sqlc.arg(state),
+    result = sqlc.arg(result),
+    completed_at = sqlc.arg(completed_at),
+    lease_worker_id = NULL,
+    lease_token = NULL,
+    lease_expires_at = NULL
+WHERE id = sqlc.arg(id);
