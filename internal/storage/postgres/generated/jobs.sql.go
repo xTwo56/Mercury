@@ -107,6 +107,41 @@ func (q *Queries) CreateJob(ctx context.Context, arg CreateJobParams) error {
 	return err
 }
 
+const failJob = `-- name: FailJob :execrows
+UPDATE jobs
+SET state = $1,
+    available_at = $2,
+    last_error = $3,
+    failed_at = $4,
+    started_at = NULL,
+    lease_worker_id = NULL,
+    lease_token = NULL,
+    lease_expires_at = NULL
+WHERE id = $5
+`
+
+type FailJobParams struct {
+	State       string
+	AvailableAt pgtype.Timestamptz
+	LastError   *string
+	FailedAt    pgtype.Timestamptz
+	ID          string
+}
+
+func (q *Queries) FailJob(ctx context.Context, arg FailJobParams) (int64, error) {
+	result, err := q.db.Exec(ctx, failJob,
+		arg.State,
+		arg.AvailableAt,
+		arg.LastError,
+		arg.FailedAt,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getJobByID = `-- name: GetJobByID :one
 SELECT
     id,

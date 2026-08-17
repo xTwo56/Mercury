@@ -76,6 +76,18 @@ SET state = sqlc.arg(state),
     lease_expires_at = sqlc.arg(lease_expires_at)
 WHERE id = sqlc.arg(id);
 
+-- name: FailJob :execrows
+UPDATE jobs
+SET state = sqlc.arg(state),
+    available_at = sqlc.arg(available_at),
+    last_error = sqlc.arg(last_error),
+    failed_at = sqlc.arg(failed_at),
+    started_at = NULL,
+    lease_worker_id = NULL,
+    lease_token = NULL,
+    lease_expires_at = NULL
+WHERE id = sqlc.arg(id);
+
 -- name: RenewJobLease :execrows
 UPDATE jobs
 SET lease_expires_at = sqlc.arg(lease_expires_at)

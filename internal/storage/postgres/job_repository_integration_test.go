@@ -791,6 +791,226 @@ func TestJobRepositoryIntegration(t *testing.T) {
 			t.Errorf("duplicate completion overwrote result: got %s, want %s", afterDuplicate.Result, accepted)
 		}
 	})
+
+	failureNow := completeNow
+	retryAt := failureNow.Add(10 * time.Minute)
+	t.Run("failure schedules retry and becomes claimable", func(t *testing.T) {
+		truncateJobs(t)
+		running := runningLeasedJob("failure-retry", startLeaseExpiresAt)
+		running.MaxAttempts = 3
+		running.AttemptsStarted = 1
+		if err := repository.Create(ctx, running); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		failed, err := repository.FailExecution(ctx, running.ID, job.WorkerID("worker-1"), job.LeaseToken("token-1"), failureNow, "temporary failure", &retryAt)
+		if err != nil {
+			t.Fatalf("FailExecution() error = %v", err)
+		}
+		want := normalizedJob(running)
+		want.State = job.StateRetryScheduled
+		want.AvailableAt = retryAt.UTC()
+		want.Lease = nil
+		want.StartedAt = nil
+		want.LastError = "temporary failure"
+		want.FailedAt = utcPointer(&failureNow)
+		assertJobEqual(t, failed, want)
+		if failed.AttemptsStarted != running.AttemptsStarted {
+			t.Errorf("FailExecution() AttemptsStarted = %d, want unchanged %d", failed.AttemptsStarted, running.AttemptsStarted)
+		}
+		if failed.FailedAt == nil || failed.FailedAt.Location() != time.UTC || failed.AvailableAt.Location() != time.UTC {
+			t.Errorf("FailExecution() timestamps = FailedAt %v AvailableAt %v, want UTC", failed.FailedAt, failed.AvailableAt)
+		}
+
+		persisted, err := repository.GetByID(ctx, running.ID)
+		if err != nil {
+			t.Fatalf("GetByID() error = %v", err)
+		}
+		assertJobEqual(t, persisted, want)
+
+		if _, err := repository.ClaimNext(ctx, job.WorkerID("worker-2"), job.LeaseToken("token-2"), retryAt.Add(-time.Microsecond), retryAt.Add(time.Minute)); !errors.Is(err, ErrNoJobAvailable) {
+			t.Fatalf("premature ClaimNext() error = %v, want ErrNoJobAvailable", err)
+		}
+		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-2"), job.LeaseToken("token-2"), retryAt, retryAt.Add(time.Minute))
+		if err != nil {
+			t.Fatalf("eligible ClaimNext() error = %v", err)
+		}
+		if claimed.ID != running.ID || claimed.AttemptsStarted != running.AttemptsStarted {
+			t.Errorf("eligible ClaimNext() job/count = %q/%d, want %q/%d", claimed.ID, claimed.AttemptsStarted, running.ID, running.AttemptsStarted)
+		}
+	})
+
+	t.Run("final attempt becomes terminal failure", func(t *testing.T) {
+		truncateJobs(t)
+		running := runningLeasedJob("failure-terminal", startLeaseExpiresAt)
+		running.MaxAttempts = 1
+		running.AttemptsStarted = 1
+		if err := repository.Create(ctx, running); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		failed, err := repository.FailExecution(ctx, running.ID, job.WorkerID("worker-1"), job.LeaseToken("token-1"), failureNow, "final failure", &retryAt)
+		if err != nil {
+			t.Fatalf("FailExecution() error = %v", err)
+		}
+		if failed.State != job.StateFailed || failed.Lease != nil || failed.StartedAt != nil {
+			t.Errorf("FailExecution() state/lease/start = %q/%#v/%v, want terminal cleared execution", failed.State, failed.Lease, failed.StartedAt)
+		}
+		if failed.AttemptsStarted != 1 || !failed.AvailableAt.Equal(running.AvailableAt) {
+			t.Errorf("terminal failure count/availability = %d/%v, want 1/%v", failed.AttemptsStarted, failed.AvailableAt, running.AvailableAt)
+		}
+		if _, err := repository.ClaimNext(ctx, job.WorkerID("worker-2"), job.LeaseToken("token-2"), retryAt, retryAt.Add(time.Minute)); !errors.Is(err, ErrNoJobAvailable) {
+			t.Fatalf("ClaimNext() terminal job error = %v, want ErrNoJobAvailable", err)
+		}
+	})
+
+	t.Run("fail missing job", func(t *testing.T) {
+		truncateJobs(t)
+		_, err := repository.FailExecution(ctx, job.JobID("missing"), job.WorkerID("worker-1"), job.LeaseToken("token-1"), failureNow, "failure", &retryAt)
+		if !errors.Is(err, ErrJobNotFound) {
+			t.Fatalf("FailExecution() error = %v, want ErrJobNotFound", err)
+		}
+	})
+
+	t.Run("rejected failures roll back", func(t *testing.T) {
+		zeroRetry := time.Time{}
+		tests := []struct {
+			name     string
+			job      job.Job
+			workerID job.WorkerID
+			token    job.LeaseToken
+			now      time.Time
+			message  string
+			retryAt  *time.Time
+		}{
+			{name: "invalid source state", job: leasableJob("failure-leased", job.StateLeased, 0, 3, startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: failureNow, message: "failure", retryAt: &retryAt},
+			{name: "wrong worker", job: runningLeasedJob("failure-wrong-worker", startLeaseExpiresAt), workerID: job.WorkerID("worker-2"), token: job.LeaseToken("token-1"), now: failureNow, message: "failure", retryAt: &retryAt},
+			{name: "wrong token", job: runningLeasedJob("failure-wrong-token", startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-2"), now: failureNow, message: "failure", retryAt: &retryAt},
+			{name: "expired lease", job: runningLeasedJob("failure-expired", failureNow.Add(-time.Microsecond)), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: failureNow, message: "failure", retryAt: &retryAt},
+			{name: "exact expiry", job: runningLeasedJob("failure-at-expiry", failureNow), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: failureNow, message: "failure", retryAt: &retryAt},
+			{name: "zero failure time", job: runningLeasedJob("failure-zero-time", startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), message: "failure", retryAt: &retryAt},
+			{name: "empty message", job: runningLeasedJob("failure-empty-message", startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: failureNow, retryAt: &retryAt},
+			{name: "missing retry time", job: runningLeasedJob("failure-missing-retry", startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: failureNow, message: "failure"},
+			{name: "zero retry time", job: runningLeasedJob("failure-zero-retry", startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: failureNow, message: "failure", retryAt: &zeroRetry},
+			{name: "retry not after failure", job: runningLeasedJob("failure-invalid-retry", startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: failureNow, message: "failure", retryAt: &failureNow},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				truncateJobs(t)
+				if err := repository.Create(ctx, tt.job); err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				if _, err := repository.FailExecution(ctx, tt.job.ID, tt.workerID, tt.token, tt.now, tt.message, tt.retryAt); err == nil {
+					t.Fatal("FailExecution() error = nil, want rejection")
+				}
+				persisted, err := repository.GetByID(ctx, tt.job.ID)
+				if err != nil {
+					t.Fatalf("GetByID() error = %v", err)
+				}
+				assertJobEqual(t, persisted, normalizedJob(tt.job))
+			})
+		}
+	})
+
+	t.Run("stale worker cannot report failure after reassignment", func(t *testing.T) {
+		truncateJobs(t)
+		running := runningLeasedJob("failure-new-owner", startLeaseExpiresAt)
+		running.Lease.WorkerID = job.WorkerID("worker-2")
+		running.Lease.Token = job.LeaseToken("token-2")
+		if err := repository.Create(ctx, running); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		if _, err := repository.FailExecution(ctx, running.ID, job.WorkerID("worker-1"), job.LeaseToken("token-1"), failureNow, "stale", &retryAt); err == nil {
+			t.Fatal("stale FailExecution() error = nil, want rejection")
+		}
+		failed, err := repository.FailExecution(ctx, running.ID, job.WorkerID("worker-2"), job.LeaseToken("token-2"), failureNow, "current owner", &retryAt)
+		if err != nil {
+			t.Fatalf("current owner FailExecution() error = %v", err)
+		}
+		if failed.LastError != "current owner" {
+			t.Errorf("LastError = %q, want current owner's report", failed.LastError)
+		}
+	})
+
+	t.Run("completion and failure race accepts one terminal state", func(t *testing.T) {
+		truncateJobs(t)
+		running := runningLeasedJob("terminal-race", startLeaseExpiresAt)
+		running.MaxAttempts = 1
+		running.AttemptsStarted = 1
+		if err := repository.Create(ctx, running); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		secondConn, err := pgx.Connect(ctx, databaseURL)
+		if err != nil {
+			t.Fatalf("connect failure reporter: %v", err)
+		}
+		defer func() {
+			if err := secondConn.Close(ctx); err != nil {
+				t.Errorf("close failure reporter connection: %v", err)
+			}
+		}()
+		if _, err := secondConn.Exec(ctx, "SET search_path TO "+qualifiedSchema); err != nil {
+			t.Fatalf("set failure reporter search path: %v", err)
+		}
+		secondRepository := NewJobRepository(secondConn)
+
+		type terminalResult struct {
+			job job.Job
+			err error
+		}
+		start := make(chan struct{})
+		results := make(chan terminalResult, 2)
+		go func() {
+			<-start
+			completed, err := repository.CompleteExecution(ctx, running.ID, job.WorkerID("worker-1"), job.LeaseToken("token-1"), json.RawMessage(`{"completed":true}`), failureNow)
+			results <- terminalResult{job: completed, err: err}
+		}()
+		go func() {
+			<-start
+			failed, err := secondRepository.FailExecution(ctx, running.ID, job.WorkerID("worker-1"), job.LeaseToken("token-1"), failureNow, "terminal failure", nil)
+			results <- terminalResult{job: failed, err: err}
+		}()
+		close(start)
+
+		var successes, rejections int
+		var accepted job.Job
+		for range 2 {
+			result := <-results
+			if result.err == nil {
+				successes++
+				accepted = result.job
+			} else {
+				rejections++
+			}
+		}
+		if successes != 1 || rejections != 1 {
+			t.Errorf("terminal race outcomes = %d successes, %d rejections; want 1 and 1", successes, rejections)
+		}
+
+		persisted, err := repository.GetByID(ctx, running.ID)
+		if err != nil {
+			t.Fatalf("GetByID() error = %v", err)
+		}
+		assertJobEqual(t, persisted, normalizedJob(accepted))
+		if persisted.Lease != nil || persisted.AttemptsStarted != running.AttemptsStarted {
+			t.Errorf("terminal state lease/count = %#v/%d, want nil/%d", persisted.Lease, persisted.AttemptsStarted, running.AttemptsStarted)
+		}
+
+		if _, err := repository.FailExecution(ctx, running.ID, job.WorkerID("worker-1"), job.LeaseToken("token-1"), failureNow.Add(time.Second), "overwrite", nil); err == nil {
+			t.Fatal("repeated FailExecution() error = nil, want rejection")
+		}
+		if _, err := repository.CompleteExecution(ctx, running.ID, job.WorkerID("worker-1"), job.LeaseToken("token-1"), json.RawMessage(`{"overwrite":true}`), failureNow.Add(time.Second)); err == nil {
+			t.Fatal("late CompleteExecution() error = nil, want rejection")
+		}
+		afterRejections, err := repository.GetByID(ctx, running.ID)
+		if err != nil {
+			t.Fatalf("GetByID() after rejection error = %v", err)
+		}
+		assertJobEqual(t, afterRejections, normalizedJob(accepted))
+	})
 }
 
 func integrationJob(id string, createdAt time.Time) job.Job {

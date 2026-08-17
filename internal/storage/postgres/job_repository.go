@@ -262,6 +262,49 @@ func (r *JobRepository) CompleteExecution(ctx context.Context, jobID job.JobID, 
 	return completed, nil
 }
 
+// FailExecution atomically authenticates and records a running job's failure.
+func (r *JobRepository) FailExecution(ctx context.Context, jobID job.JobID, workerID job.WorkerID, token job.LeaseToken, now time.Time, message string, retryAt *time.Time) (job.Job, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return job.Job{}, fmt.Errorf("fail job %q: begin transaction: %w", jobID, err)
+	}
+
+	queries := r.queries.WithTx(tx)
+	row, err := queries.GetJobByIDForUpdate(ctx, string(jobID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("fail job %q: %w", jobID, ErrJobNotFound))
+	}
+	if err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("fail job %q: load: %w", jobID, err))
+	}
+
+	failed, err := jobFromRow(row)
+	if err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("fail job %q: decode: %w", jobID, err))
+	}
+	if err := failed.Fail(workerID, token, now, message, retryAt); err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("fail job %q: validate: %w", jobID, err))
+	}
+
+	rowsAffected, err := queries.FailJob(ctx, generated.FailJobParams{
+		ID:          string(failed.ID),
+		State:       string(failed.State),
+		AvailableAt: timestamptz(failed.AvailableAt),
+		LastError:   nullableString(failed.LastError),
+		FailedAt:    nullableTimestamptz(failed.FailedAt),
+	})
+	if err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("fail job %q: persist: %w", jobID, err))
+	}
+	if rowsAffected != 1 {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("fail job %q: persist affected %d rows", jobID, rowsAffected))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("fail job %q: commit transaction: %w", jobID, err))
+	}
+	return failed, nil
+}
+
 func rollbackTransaction(ctx context.Context, tx pgx.Tx, cause error) error {
 	if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
 		return fmt.Errorf("%w; rollback transaction: %w", cause, err)
