@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,14 +52,14 @@ func TestCoordinatorPostgreSQLIntegration(t *testing.T) {
 
 	repository := postgres.NewJobRepository(conn)
 	now := time.Now().UTC()
-	submitted, err := job.New(job.JobID("worker-sleep"), task.SleepTaskType, json.RawMessage(`{"duration_ms":1}`), 1, now, now)
+	submitted, err := job.New(job.JobID("worker-sleep"), task.SleepTaskType, json.RawMessage(`{"duration_ms":250}`), 1, now, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := repository.Create(ctx, submitted); err != nil {
 		t.Fatal(err)
 	}
-	observed := &observedRepository{JobRepository: repository, completed: make(chan struct{}, 1)}
+	observed := &observedRepository{JobRepository: repository, completed: make(chan struct{}, 1), renewed: make(chan struct{}, 16)}
 	handlers := task.NewHandlerRegistry()
 	sleep, _ := task.NewSleepHandler(task.NewSystemTimerFactory())
 	if err := handlers.Register(task.SleepTaskType, sleep); err != nil {
@@ -67,14 +68,34 @@ func TestCoordinatorPostgreSQLIntegration(t *testing.T) {
 	handlers.Seal()
 	coordinator, err := worker.NewCoordinator(observed, handlers, worker.NewSystemClock(), worker.RandomTokenGenerator{}, slog.New(slog.NewTextHandler(io.Discard, nil)), worker.Config{
 		WorkerID: job.WorkerID("integration-worker"), Concurrency: 1, PollInterval: time.Second,
-		LeaseDuration: time.Minute, RetryDelay: time.Minute,
-	}, func(err error) bool { return errors.Is(err, postgres.ErrNoJobAvailable) })
+		LeaseDuration: 90 * time.Millisecond, RetryDelay: time.Minute, HeartbeatInterval: 20 * time.Millisecond,
+	}, func(err error) bool { return errors.Is(err, postgres.ErrNoJobAvailable) }, func(err error) bool {
+		return errors.Is(err, postgres.ErrJobNotFound) || errors.Is(err, job.ErrJobNotRunning) || errors.Is(err, job.ErrLeaseMissing) || errors.Is(err, job.ErrLeaseWorkerMismatch) || errors.Is(err, job.ErrLeaseTokenMismatch) || errors.Is(err, job.ErrLeaseExpired)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- coordinator.Run(runCtx) }()
+	for range 2 {
+		select {
+		case <-observed.renewed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for lease renewal")
+		}
+	}
+	// Wait beyond the original lease duration while heartbeats continue, then
+	// prove recovery cannot reclaim the actively owned execution.
+	time.Sleep(70 * time.Millisecond)
+	recoveryNow := time.Now().UTC()
+	recovered, err := repository.RecoverExpiredLeases(ctx, recoveryNow, recoveryNow.Add(time.Minute), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered) != 0 {
+		t.Fatalf("recovered actively heartbeating jobs = %v", recovered)
+	}
 	select {
 	case <-observed.completed:
 	case <-time.After(5 * time.Second):
@@ -89,14 +110,28 @@ func TestCoordinatorPostgreSQLIntegration(t *testing.T) {
 	if persisted.State != job.StateSucceeded || persisted.AttemptsStarted != 1 || persisted.StartedAt == nil || persisted.CompletedAt == nil || persisted.Lease != nil {
 		t.Errorf("persisted lifecycle = %#v", persisted)
 	}
-	if string(persisted.Result) != `{"duration_ms":1}` {
+	if observed.renewalCount.Load() < 2 {
+		t.Errorf("renewal count = %d, want at least 2", observed.renewalCount.Load())
+	}
+	if string(persisted.Result) != `{"duration_ms":250}` {
 		t.Errorf("result = %s", persisted.Result)
 	}
 }
 
 type observedRepository struct {
 	*postgres.JobRepository
-	completed chan struct{}
+	completed    chan struct{}
+	renewed      chan struct{}
+	renewalCount atomic.Int32
+}
+
+func (repository *observedRepository) RenewLease(ctx context.Context, id job.JobID, workerID job.WorkerID, token job.LeaseToken, now, expiresAt time.Time) (job.Job, error) {
+	renewed, err := repository.JobRepository.RenewLease(ctx, id, workerID, token, now, expiresAt)
+	if err == nil {
+		repository.renewalCount.Add(1)
+		repository.renewed <- struct{}{}
+	}
+	return renewed, err
 }
 
 func (repository *observedRepository) CompleteExecution(ctx context.Context, id job.JobID, workerID job.WorkerID, token job.LeaseToken, result json.RawMessage, now time.Time) (job.Job, error) {

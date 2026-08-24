@@ -22,6 +22,7 @@ type Repository interface {
 	StartExecution(context.Context, job.JobID, job.WorkerID, job.LeaseToken, time.Time) (job.Job, error)
 	CompleteExecution(context.Context, job.JobID, job.WorkerID, job.LeaseToken, json.RawMessage, time.Time) (job.Job, error)
 	FailExecution(context.Context, job.JobID, job.WorkerID, job.LeaseToken, time.Time, string, *time.Time) (job.Job, error)
+	RenewLease(context.Context, job.JobID, job.WorkerID, job.LeaseToken, time.Time, time.Time) (job.Job, error)
 }
 
 // Clock supplies worker time and polling tickers.
@@ -43,29 +44,31 @@ type TokenGenerator interface {
 
 // Config controls worker identity, timing, and concurrency.
 type Config struct {
-	WorkerID      job.WorkerID
-	Concurrency   int
-	PollInterval  time.Duration
-	LeaseDuration time.Duration
-	RetryDelay    time.Duration
+	WorkerID          job.WorkerID
+	Concurrency       int
+	PollInterval      time.Duration
+	LeaseDuration     time.Duration
+	RetryDelay        time.Duration
+	HeartbeatInterval time.Duration
 }
 
 // Coordinator polls for jobs and executes them within a fixed slot bound.
 type Coordinator struct {
-	repository Repository
-	handlers   *task.HandlerRegistry
-	clock      Clock
-	tokens     TokenGenerator
-	logger     *slog.Logger
-	config     Config
-	slots      chan struct{}
-	active     sync.WaitGroup
-	isNoJob    func(error) bool
+	repository      Repository
+	handlers        *task.HandlerRegistry
+	clock           Clock
+	tokens          TokenGenerator
+	logger          *slog.Logger
+	config          Config
+	slots           chan struct{}
+	active          sync.WaitGroup
+	isNoJob         func(error) bool
+	isOwnershipLost func(error) bool
 }
 
 // NewCoordinator validates dependencies and constructs a worker coordinator.
-func NewCoordinator(repository Repository, handlers *task.HandlerRegistry, clock Clock, tokens TokenGenerator, logger *slog.Logger, config Config, isNoJob func(error) bool) (*Coordinator, error) {
-	if repository == nil || handlers == nil || clock == nil || tokens == nil || isNoJob == nil {
+func NewCoordinator(repository Repository, handlers *task.HandlerRegistry, clock Clock, tokens TokenGenerator, logger *slog.Logger, config Config, isNoJob, isOwnershipLost func(error) bool) (*Coordinator, error) {
+	if repository == nil || handlers == nil || clock == nil || tokens == nil || isNoJob == nil || isOwnershipLost == nil {
 		return nil, errors.New("worker dependencies must not be nil")
 	}
 	if config.WorkerID == "" {
@@ -74,13 +77,16 @@ func NewCoordinator(repository Repository, handlers *task.HandlerRegistry, clock
 	if config.Concurrency <= 0 {
 		return nil, errors.New("worker concurrency must be positive")
 	}
-	if config.PollInterval <= 0 || config.LeaseDuration <= 0 || config.RetryDelay <= 0 {
+	if config.PollInterval <= 0 || config.LeaseDuration <= 0 || config.RetryDelay <= 0 || config.HeartbeatInterval <= 0 {
 		return nil, errors.New("worker timing values must be positive")
+	}
+	if config.HeartbeatInterval >= config.LeaseDuration/2 {
+		return nil, errors.New("worker heartbeat interval must leave sufficient lease-renewal margin")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Coordinator{repository: repository, handlers: handlers, clock: clock, tokens: tokens, logger: logger, config: config, slots: make(chan struct{}, config.Concurrency), isNoJob: isNoJob}, nil
+	return &Coordinator{repository: repository, handlers: handlers, clock: clock, tokens: tokens, logger: logger, config: config, slots: make(chan struct{}, config.Concurrency), isNoJob: isNoJob, isOwnershipLost: isOwnershipLost}, nil
 }
 
 // Run polls immediately and periodically until cancellation, then waits for active handlers.
@@ -144,18 +150,80 @@ func (coordinator *Coordinator) execute(ctx context.Context, claimed job.Job, to
 		coordinator.logger.ErrorContext(ctx, "start job execution", "job_id", claimed.ID, "task_type", claimed.TaskType, "error", err)
 		return
 	}
-	handler, err := coordinator.handlers.Lookup(started.TaskType)
-	if err != nil {
-		coordinator.reportFailure(ctx, started, token, err)
+	if started.Lease == nil {
+		coordinator.logger.ErrorContext(ctx, "start job execution returned no lease", "job_id", started.ID, "task_type", started.TaskType)
 		return
 	}
-	result, err := handler.Execute(ctx, started.Payload)
+	executionCtx, cancelExecution := context.WithCancel(ctx)
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+	heartbeatDone := make(chan heartbeatOutcome, 1)
+	go func() { heartbeatDone <- coordinator.heartbeat(heartbeatCtx, cancelExecution, started, token) }()
+	handler, err := coordinator.handlers.Lookup(started.TaskType)
+	if err != nil {
+		stopHeartbeat()
+		heartbeat := <-heartbeatDone
+		cancelExecution()
+		if !heartbeat.ownershipLost && ctx.Err() == nil && coordinator.clock.Now().Before(heartbeat.confirmedExpiration) {
+			coordinator.reportFailure(ctx, started, token, err)
+		}
+		return
+	}
+	result, err := handler.Execute(executionCtx, started.Payload)
+	stopHeartbeat()
+	heartbeat := <-heartbeatDone
+	cancelExecution()
+	// Joining the heartbeat before terminal persistence prevents renewal from
+	// racing completion or failure with the same lease credential.
+	if heartbeat.ownershipLost || ctx.Err() != nil || !coordinator.clock.Now().Before(heartbeat.confirmedExpiration) {
+		return
+	}
 	if err != nil {
 		coordinator.reportFailure(ctx, started, token, err)
 		return
 	}
 	if _, err := coordinator.repository.CompleteExecution(ctx, started.ID, coordinator.config.WorkerID, token, result, coordinator.clock.Now()); err != nil {
 		coordinator.logger.ErrorContext(ctx, "complete job execution", "job_id", started.ID, "task_type", started.TaskType, "error", err)
+	}
+}
+
+type heartbeatOutcome struct {
+	confirmedExpiration time.Time
+	ownershipLost       bool
+}
+
+func (coordinator *Coordinator) heartbeat(ctx context.Context, cancelExecution context.CancelFunc, started job.Job, token job.LeaseToken) heartbeatOutcome {
+	confirmed := started.Lease.ExpiresAt
+	ticker := coordinator.clock.NewTicker(coordinator.config.HeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return heartbeatOutcome{confirmedExpiration: confirmed}
+		case <-ticker.C():
+			now := coordinator.clock.Now()
+			if !now.Before(confirmed) {
+				cancelExecution()
+				return heartbeatOutcome{confirmedExpiration: confirmed, ownershipLost: true}
+			}
+			proposed := now.Add(coordinator.config.LeaseDuration)
+			if !proposed.After(confirmed) {
+				continue
+			}
+			renewed, err := coordinator.repository.RenewLease(ctx, started.ID, coordinator.config.WorkerID, token, now, proposed)
+			if err != nil {
+				if coordinator.isOwnershipLost(err) || !coordinator.clock.Now().Before(confirmed) {
+					cancelExecution()
+					return heartbeatOutcome{confirmedExpiration: confirmed, ownershipLost: true}
+				}
+				coordinator.logger.ErrorContext(ctx, "renew job lease", "job_id", started.ID, "task_type", started.TaskType, "error", err)
+				continue
+			}
+			if renewed.Lease == nil || !renewed.Lease.ExpiresAt.After(confirmed) {
+				cancelExecution()
+				return heartbeatOutcome{confirmedExpiration: confirmed, ownershipLost: true}
+			}
+			confirmed = renewed.Lease.ExpiresAt
+		}
 	}
 }
 

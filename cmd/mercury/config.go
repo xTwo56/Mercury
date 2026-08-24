@@ -26,6 +26,7 @@ const (
 	workerConcurrencyEnvironment   = "MERCURY_WORKER_CONCURRENCY"
 	workerPollIntervalEnvironment  = "MERCURY_WORKER_POLL_INTERVAL"
 	workerLeaseDurationEnvironment = "MERCURY_WORKER_LEASE_DURATION"
+	workerHeartbeatEnvironment     = "MERCURY_WORKER_HEARTBEAT_INTERVAL"
 
 	defaultRecoveryInterval    = time.Minute
 	defaultRecoveryRetryDelay  = time.Minute
@@ -43,21 +44,22 @@ const (
 )
 
 type config struct {
-	DatabaseURL           string
-	RecoveryInterval      time.Duration
-	RecoveryRetryDelay    time.Duration
-	RecoveryBatchSize     int
-	HTTPListenAddress     string
-	HTTPReadTimeout       time.Duration
-	HTTPReadHeaderTimeout time.Duration
-	HTTPWriteTimeout      time.Duration
-	HTTPIdleTimeout       time.Duration
-	HTTPShutdownTimeout   time.Duration
-	WorkerID              job.WorkerID
-	WorkerConcurrency     int
-	WorkerPollInterval    time.Duration
-	WorkerLeaseDuration   time.Duration
-	WorkerRetryDelay      time.Duration
+	DatabaseURL             string
+	RecoveryInterval        time.Duration
+	RecoveryRetryDelay      time.Duration
+	RecoveryBatchSize       int
+	HTTPListenAddress       string
+	HTTPReadTimeout         time.Duration
+	HTTPReadHeaderTimeout   time.Duration
+	HTTPWriteTimeout        time.Duration
+	HTTPIdleTimeout         time.Duration
+	HTTPShutdownTimeout     time.Duration
+	WorkerID                job.WorkerID
+	WorkerConcurrency       int
+	WorkerPollInterval      time.Duration
+	WorkerLeaseDuration     time.Duration
+	WorkerRetryDelay        time.Duration
+	WorkerHeartbeatInterval time.Duration
 }
 
 func loadConfig(getenv func(string) string) (config, error) {
@@ -114,21 +116,28 @@ func loadConfig(getenv func(string) string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	workerHeartbeatInterval, err := environmentDuration(getenv, workerHeartbeatEnvironment, workerLeaseDuration/3)
+	if err != nil {
+		return config{}, err
+	}
 
 	loaded := config{
-		DatabaseURL:           databaseURL,
-		RecoveryInterval:      interval,
-		RecoveryRetryDelay:    defaultRecoveryRetryDelay,
-		RecoveryBatchSize:     batchSize,
-		HTTPListenAddress:     httpListenAddress,
-		HTTPReadTimeout:       httpReadTimeout,
-		HTTPReadHeaderTimeout: httpHeaderTimeout,
-		HTTPWriteTimeout:      httpWriteTimeout,
-		HTTPIdleTimeout:       httpIdleTimeout,
-		HTTPShutdownTimeout:   httpShutdownTimeout,
-		WorkerID:              workerID, WorkerConcurrency: workerConcurrency,
-		WorkerPollInterval: workerPollInterval, WorkerLeaseDuration: workerLeaseDuration,
-		WorkerRetryDelay: defaultWorkerRetryDelay,
+		DatabaseURL:             databaseURL,
+		RecoveryInterval:        interval,
+		RecoveryRetryDelay:      defaultRecoveryRetryDelay,
+		RecoveryBatchSize:       batchSize,
+		HTTPListenAddress:       httpListenAddress,
+		HTTPReadTimeout:         httpReadTimeout,
+		HTTPReadHeaderTimeout:   httpHeaderTimeout,
+		HTTPWriteTimeout:        httpWriteTimeout,
+		HTTPIdleTimeout:         httpIdleTimeout,
+		HTTPShutdownTimeout:     httpShutdownTimeout,
+		WorkerID:                workerID,
+		WorkerConcurrency:       workerConcurrency,
+		WorkerPollInterval:      workerPollInterval,
+		WorkerLeaseDuration:     workerLeaseDuration,
+		WorkerRetryDelay:        defaultWorkerRetryDelay,
+		WorkerHeartbeatInterval: workerHeartbeatInterval,
 	}
 	if err := loaded.validate(); err != nil {
 		return config{}, err
@@ -163,6 +172,9 @@ func (configuration config) validate() error {
 	}
 	if configuration.WorkerPollInterval <= 0 || configuration.WorkerLeaseDuration <= 0 || configuration.WorkerRetryDelay <= 0 {
 		return errors.New("worker timing values must be positive")
+	}
+	if configuration.WorkerHeartbeatInterval <= 0 || configuration.WorkerHeartbeatInterval >= configuration.WorkerLeaseDuration/2 {
+		return errors.New("worker heartbeat interval must be positive and leave sufficient lease-renewal margin")
 	}
 	return nil
 }

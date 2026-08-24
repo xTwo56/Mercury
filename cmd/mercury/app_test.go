@@ -153,7 +153,8 @@ func validConfig() config {
 		HTTPShutdownTimeout:   defaultHTTPShutdownTimeout,
 		WorkerID:              job.WorkerID("worker-test"), WorkerConcurrency: defaultWorkerConcurrency,
 		WorkerPollInterval: defaultWorkerPollInterval, WorkerLeaseDuration: defaultWorkerLeaseDuration,
-		WorkerRetryDelay: defaultWorkerRetryDelay,
+		WorkerRetryDelay:        defaultWorkerRetryDelay,
+		WorkerHeartbeatInterval: defaultWorkerLeaseDuration / 3,
 	}
 }
 

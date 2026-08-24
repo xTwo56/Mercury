@@ -34,7 +34,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 		t.Errorf("HTTP defaults = %#v, want configured defaults", configuration)
 	}
 	if configuration.WorkerID == "" || configuration.WorkerConcurrency != defaultWorkerConcurrency ||
-		configuration.WorkerPollInterval != defaultWorkerPollInterval || configuration.WorkerLeaseDuration != defaultWorkerLeaseDuration {
+		configuration.WorkerPollInterval != defaultWorkerPollInterval || configuration.WorkerLeaseDuration != defaultWorkerLeaseDuration ||
+		configuration.WorkerHeartbeatInterval != defaultWorkerLeaseDuration/3 {
 		t.Errorf("worker defaults = %#v, want non-empty identity and configured defaults", configuration)
 	}
 	if configuration.WorkerLeaseDuration <= time.Duration(task.MaxSleepDurationMS)*time.Millisecond {
@@ -53,6 +54,8 @@ func TestLoadConfigOverrides(t *testing.T) {
 		httpWriteTimeoutEnvironment:    "4s",
 		httpIdleTimeoutEnvironment:     "5s",
 		httpShutdownTimeoutEnvironment: "6s",
+		workerLeaseDurationEnvironment: "30s",
+		workerHeartbeatEnvironment:     "8s",
 	}))
 	if err != nil {
 		t.Fatalf("loadConfig() error = %v", err)
@@ -64,6 +67,9 @@ func TestLoadConfigOverrides(t *testing.T) {
 		configuration.HTTPReadHeaderTimeout != 3*time.Second || configuration.HTTPWriteTimeout != 4*time.Second ||
 		configuration.HTTPIdleTimeout != 5*time.Second || configuration.HTTPShutdownTimeout != 6*time.Second {
 		t.Errorf("HTTP overrides = %#v, want configured address and timeouts", configuration)
+	}
+	if configuration.WorkerLeaseDuration != 30*time.Second || configuration.WorkerHeartbeatInterval != 8*time.Second {
+		t.Errorf("worker timing overrides = %#v", configuration)
 	}
 }
 
@@ -91,6 +97,9 @@ func TestLoadConfigValidation(t *testing.T) {
 		{name: "invalid worker concurrency", values: map[string]string{databaseURLEnvironment: "postgres://database/db", workerConcurrencyEnvironment: "many"}},
 		{name: "zero worker poll interval", values: map[string]string{databaseURLEnvironment: "postgres://database/db", workerPollIntervalEnvironment: "0s"}},
 		{name: "zero worker lease duration", values: map[string]string{databaseURLEnvironment: "postgres://database/db", workerLeaseDurationEnvironment: "0s"}},
+		{name: "invalid worker heartbeat", values: map[string]string{databaseURLEnvironment: "postgres://database/db", workerHeartbeatEnvironment: "often"}},
+		{name: "zero worker heartbeat", values: map[string]string{databaseURLEnvironment: "postgres://database/db", workerHeartbeatEnvironment: "0s"}},
+		{name: "heartbeat without margin", values: map[string]string{databaseURLEnvironment: "postgres://database/db", workerLeaseDurationEnvironment: "30s", workerHeartbeatEnvironment: "15s"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

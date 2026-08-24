@@ -16,7 +16,10 @@ import (
 	"github.com/xtwo56/mercury/internal/task"
 )
 
-var errNoJob = errors.New("no job")
+var (
+	errNoJob      = errors.New("no job")
+	errMissingJob = errors.New("missing job")
+)
 
 func TestCoordinatorSuccessfulExecution(t *testing.T) {
 	repository := &fakeRepository{jobs: []job.Job{workerJob("job-1", task.SleepTaskType)}}
@@ -128,8 +131,70 @@ func TestCoordinatorIdleAndConfiguration(t *testing.T) {
 
 	config := validWorkerConfig()
 	config.Concurrency = 0
-	if _, err := NewCoordinator(repository, task.NewHandlerRegistry(), clock, &fakeTokens{}, nil, config, func(error) bool { return false }); err == nil {
+	if _, err := NewCoordinator(repository, task.NewHandlerRegistry(), clock, &fakeTokens{}, nil, config, func(error) bool { return false }, func(error) bool { return false }); err == nil {
 		t.Fatal("NewCoordinator() accepted zero concurrency")
+	}
+}
+
+func TestCoordinatorHeartbeatRenewalAndOwnershipLoss(t *testing.T) {
+	tests := []struct {
+		name          string
+		renewErrors   []error
+		secondTime    time.Time
+		wantRenewals  int
+		wantComplete  int
+		wantCancelled bool
+		definitive    bool
+	}{
+		{name: "successful renewal", secondTime: time.Date(2026, 8, 24, 12, 10, 0, 0, time.UTC), wantRenewals: 1, wantComplete: 1},
+		{name: "transient then success", renewErrors: []error{errors.New("temporary"), nil}, secondTime: time.Date(2026, 8, 24, 12, 20, 0, 0, time.UTC), wantRenewals: 2, wantComplete: 1},
+		{name: "wrong worker", renewErrors: []error{job.ErrLeaseWorkerMismatch}, wantRenewals: 1, wantCancelled: true, definitive: true},
+		{name: "wrong token", renewErrors: []error{job.ErrLeaseTokenMismatch}, wantRenewals: 1, wantCancelled: true, definitive: true},
+		{name: "expired lease", renewErrors: []error{job.ErrLeaseExpired}, wantRenewals: 1, wantCancelled: true, definitive: true},
+		{name: "invalid state", renewErrors: []error{job.ErrJobNotRunning}, wantRenewals: 1, wantCancelled: true, definitive: true},
+		{name: "missing lease", renewErrors: []error{job.ErrLeaseMissing}, wantRenewals: 1, wantCancelled: true, definitive: true},
+		{name: "missing job", renewErrors: []error{errMissingJob}, wantRenewals: 1, wantCancelled: true, definitive: true},
+		{name: "transient until expiration", renewErrors: []error{errors.New("temporary")}, secondTime: time.Date(2026, 8, 24, 13, 0, 0, 0, time.UTC), wantRenewals: 1, wantCancelled: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repository := &fakeRepository{jobs: []job.Job{workerJob("job-1", task.SleepTaskType)}, renewErrors: append([]error(nil), tt.renewErrors...), renewed: make(chan struct{}, 4)}
+			handler := &blockingHandler{entered: make(chan struct{}, 1), release: make(chan struct{}, 1), exited: make(chan struct{}, 1)}
+			coordinator, clock := testCoordinatorWithHandler(t, repository, handler, 1)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- coordinator.Run(ctx) }()
+			receiveSignal(t, handler.entered)
+			heartbeatTicker := receiveTicker(t, clock.heartbeatCreated)
+
+			clock.setNow(time.Date(2026, 8, 24, 12, 10, 0, 0, time.UTC))
+			heartbeatTicker.ticks <- clock.Now()
+			if len(tt.renewErrors) > 0 && !tt.definitive {
+				receiveSignal(t, repository.renewed)
+				clock.setNow(tt.secondTime)
+				heartbeatTicker.ticks <- clock.Now()
+			}
+			if tt.wantCancelled {
+				receiveSignal(t, handler.exited)
+			} else {
+				receiveSignal(t, repository.renewed)
+				handler.release <- struct{}{}
+				receiveSignal(t, repository.completed)
+			}
+			cancel()
+			receiveError(t, done)
+			if repository.renewCount() != tt.wantRenewals || repository.completeCalls != tt.wantComplete || repository.failCalls != 0 {
+				t.Errorf("renew/complete/fail = %d/%d/%d, want %d/%d/0", repository.renewCount(), repository.completeCalls, repository.failCalls, tt.wantRenewals, tt.wantComplete)
+			}
+			if !heartbeatTicker.stopped {
+				t.Error("heartbeat ticker was not stopped")
+			}
+			for _, call := range repository.renewCalls {
+				if call.workerID != job.WorkerID("worker-1") || call.token != repository.claimTokens[0] {
+					t.Errorf("renewal identifiers changed: %#v", call)
+				}
+			}
+		})
 	}
 }
 
@@ -144,7 +209,7 @@ func testCoordinatorWithHandler(t *testing.T, repository *fakeRepository, handle
 		t.Fatal(err)
 	}
 	registry.Seal()
-	clock := &fakeClock{now: time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)}
+	clock := &fakeClock{now: time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC), heartbeatCreated: make(chan *fakeTicker, 10)}
 	clock.created = make(chan struct{}, 1)
 	if repository.completed == nil {
 		repository.completed = make(chan struct{}, 10)
@@ -155,18 +220,24 @@ func testCoordinatorWithHandler(t *testing.T, repository *fakeRepository, handle
 	repository.claimed = make(map[job.JobID]job.Job)
 	config := validWorkerConfig()
 	config.Concurrency = concurrency
-	coordinator, err := NewCoordinator(repository, registry, clock, &fakeTokens{}, slog.New(slog.NewTextHandler(io.Discard, nil)), config, func(err error) bool { return errors.Is(err, errNoJob) })
+	coordinator, err := NewCoordinator(repository, registry, clock, &fakeTokens{}, slog.New(slog.NewTextHandler(io.Discard, nil)), config, func(err error) bool { return errors.Is(err, errNoJob) }, isTestOwnershipLoss)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return coordinator, clock
 }
 
+func isTestOwnershipLoss(err error) bool {
+	return errors.Is(err, errMissingJob) || errors.Is(err, job.ErrJobNotRunning) ||
+		errors.Is(err, job.ErrLeaseMissing) || errors.Is(err, job.ErrLeaseWorkerMismatch) ||
+		errors.Is(err, job.ErrLeaseTokenMismatch) || errors.Is(err, job.ErrLeaseExpired)
+}
+
 func validWorkerConfig() Config {
-	return Config{WorkerID: job.WorkerID("worker-1"), Concurrency: 1, PollInterval: time.Second, LeaseDuration: time.Hour, RetryDelay: time.Minute}
+	return Config{WorkerID: job.WorkerID("worker-1"), Concurrency: 1, PollInterval: time.Second, LeaseDuration: time.Hour, RetryDelay: time.Minute, HeartbeatInterval: 10 * time.Minute}
 }
 func workerJob(id string, taskType job.TaskType) job.Job {
-	return job.Job{ID: job.JobID(id), TaskType: taskType, Payload: json.RawMessage(`{"duration_ms":1}`), State: job.StateLeased, MaxAttempts: 3}
+	return job.Job{ID: job.JobID(id), TaskType: taskType, Payload: json.RawMessage(`{"duration_ms":1}`), State: job.StateLeased, MaxAttempts: 3, Lease: &job.Lease{WorkerID: job.WorkerID("worker-1"), Token: job.LeaseToken("token"), ExpiresAt: time.Date(2026, 8, 24, 13, 0, 0, 0, time.UTC)}}
 }
 
 type fakeRepository struct {
@@ -178,6 +249,9 @@ type fakeRepository struct {
 	startCalls, completeCalls, failCalls int
 	completed                            chan struct{}
 	finished                             chan struct{}
+	renewErrors                          []error
+	renewCalls                           []renewCall
+	renewed                              chan struct{}
 }
 
 func (r *fakeRepository) ClaimNext(_ context.Context, _ job.WorkerID, token job.LeaseToken, _, _ time.Time) (job.Job, error) {
@@ -217,6 +291,31 @@ func (r *fakeRepository) FailExecution(_ context.Context, id job.JobID, _ job.Wo
 	r.signalFinished()
 	return job.Job{ID: id}, r.failError
 }
+
+type renewCall struct {
+	workerID       job.WorkerID
+	token          job.LeaseToken
+	now, expiresAt time.Time
+}
+
+func (r *fakeRepository) RenewLease(_ context.Context, id job.JobID, workerID job.WorkerID, token job.LeaseToken, now time.Time, expiresAt time.Time) (job.Job, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.renewCalls = append(r.renewCalls, renewCall{workerID: workerID, token: token, now: now, expiresAt: expiresAt})
+	var err error
+	if len(r.renewErrors) > 0 {
+		err = r.renewErrors[0]
+		r.renewErrors = r.renewErrors[1:]
+	}
+	if r.renewed != nil {
+		r.renewed <- struct{}{}
+	}
+	if err != nil {
+		return job.Job{}, err
+	}
+	return job.Job{ID: id, Lease: &job.Lease{WorkerID: workerID, Token: token, ExpiresAt: expiresAt}}, nil
+}
+func (r *fakeRepository) renewCount() int { r.mu.Lock(); defer r.mu.Unlock(); return len(r.renewCalls) }
 func (r *fakeRepository) signalCompleted() {
 	if r.completed == nil {
 		r.completed = make(chan struct{}, 10)
@@ -251,11 +350,14 @@ func (h *fakeHandler) Execute(context.Context, json.RawMessage) (json.RawMessage
 }
 
 type blockingHandler struct {
-	entered, release  chan struct{}
-	active, maxActive int32
+	entered, release, exited chan struct{}
+	active, maxActive        int32
 }
 
 func (h *blockingHandler) Execute(ctx context.Context, _ json.RawMessage) (json.RawMessage, error) {
+	if h.exited != nil {
+		defer func() { h.exited <- struct{}{} }()
+	}
 	active := atomic.AddInt32(&h.active, 1)
 	for {
 		max := atomic.LoadInt32(&h.maxActive)
@@ -287,18 +389,34 @@ func (g *fakeTokens) NewLeaseToken() (job.LeaseToken, error) {
 }
 
 type fakeClock struct {
-	now     time.Time
-	ticker  *fakeTicker
-	created chan struct{}
+	mu               sync.Mutex
+	now              time.Time
+	ticker           *fakeTicker
+	created          chan struct{}
+	heartbeatCreated chan *fakeTicker
 }
 
-func (c *fakeClock) Now() time.Time { return c.now }
-func (c *fakeClock) NewTicker(time.Duration) Ticker {
-	c.ticker = &fakeTicker{ticks: make(chan time.Time, 10)}
-	c.created <- struct{}{}
-	return c.ticker
+func (c *fakeClock) Now() time.Time       { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
+func (c *fakeClock) setNow(now time.Time) { c.mu.Lock(); c.now = now; c.mu.Unlock() }
+func (c *fakeClock) NewTicker(interval time.Duration) Ticker {
+	ticker := &fakeTicker{ticks: make(chan time.Time, 10)}
+	if interval == time.Second {
+		c.mu.Lock()
+		c.ticker = ticker
+		c.mu.Unlock()
+		c.created <- struct{}{}
+	} else if c.heartbeatCreated != nil {
+		c.heartbeatCreated <- ticker
+	}
+	return ticker
 }
-func (c *fakeClock) tick() { c.ticker.ticks <- c.now }
+func (c *fakeClock) tick() {
+	c.mu.Lock()
+	ticker := c.ticker
+	now := c.now
+	c.mu.Unlock()
+	ticker.ticks <- now
+}
 
 type fakeTicker struct {
 	ticks   chan time.Time
@@ -320,6 +438,16 @@ func receiveError(t *testing.T, ch <-chan error) error {
 	select {
 	case e := <-ch:
 		return e
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+		return nil
+	}
+}
+func receiveTicker(t *testing.T, ch <-chan *fakeTicker) *fakeTicker {
+	t.Helper()
+	select {
+	case ticker := <-ch:
+		return ticker
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
 		return nil

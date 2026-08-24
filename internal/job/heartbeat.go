@@ -5,6 +5,19 @@ import (
 	"time"
 )
 
+var (
+	// ErrJobNotRunning identifies lease renewal rejected outside the running state.
+	ErrJobNotRunning = errors.New("job is not running")
+	// ErrLeaseMissing identifies an operation rejected because no current lease exists.
+	ErrLeaseMissing = errors.New("job has no lease")
+	// ErrLeaseWorkerMismatch identifies a lease owned by another worker.
+	ErrLeaseWorkerMismatch = errors.New("lease worker does not match")
+	// ErrLeaseTokenMismatch identifies invalid lease credentials.
+	ErrLeaseTokenMismatch = errors.New("lease token does not match")
+	// ErrLeaseExpired identifies a lease that is no longer valid at the supplied time.
+	ErrLeaseExpired = errors.New("lease has expired")
+)
+
 // RenewLease extends the current lease held by a running job.
 func (j *Job) RenewLease(workerID WorkerID, token LeaseToken, now, newExpiresAt time.Time) error {
 	if now.IsZero() {
@@ -14,19 +27,19 @@ func (j *Job) RenewLease(workerID WorkerID, token LeaseToken, now, newExpiresAt 
 		return errors.New("new lease expiration must not be zero")
 	}
 	if j.State != StateRunning {
-		return errors.New("job is not running")
+		return ErrJobNotRunning
 	}
 	if j.Lease == nil {
-		return errors.New("job has no lease")
+		return ErrLeaseMissing
 	}
 	if workerID != j.Lease.WorkerID {
-		return errors.New("lease worker does not match")
+		return ErrLeaseWorkerMismatch
 	}
 	if token != j.Lease.Token {
-		return errors.New("lease token does not match")
+		return ErrLeaseTokenMismatch
 	}
 	if !now.Before(j.Lease.ExpiresAt) {
-		return errors.New("lease has expired")
+		return ErrLeaseExpired
 	}
 	if !newExpiresAt.After(now) {
 		return errors.New("new lease expiration must be after current time")

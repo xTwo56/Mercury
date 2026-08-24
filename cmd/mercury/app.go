@@ -71,8 +71,12 @@ func productionDependencies() applicationDependencies {
 			workerCoordinator, err := worker.NewCoordinator(repository, handlers, worker.NewSystemClock(), worker.RandomTokenGenerator{}, logger, worker.Config{
 				WorkerID: configuration.WorkerID, Concurrency: configuration.WorkerConcurrency,
 				PollInterval: configuration.WorkerPollInterval, LeaseDuration: configuration.WorkerLeaseDuration,
-				RetryDelay: configuration.WorkerRetryDelay,
-			}, func(err error) bool { return errors.Is(err, postgres.ErrNoJobAvailable) })
+				RetryDelay: configuration.WorkerRetryDelay, HeartbeatInterval: configuration.WorkerHeartbeatInterval,
+			}, func(err error) bool { return errors.Is(err, postgres.ErrNoJobAvailable) }, func(err error) bool {
+				return errors.Is(err, postgres.ErrJobNotFound) || errors.Is(err, job.ErrJobNotRunning) ||
+					errors.Is(err, job.ErrLeaseMissing) || errors.Is(err, job.ErrLeaseWorkerMismatch) ||
+					errors.Is(err, job.ErrLeaseTokenMismatch) || errors.Is(err, job.ErrLeaseExpired)
+			})
 			if err != nil {
 				return applicationServices{}, err
 			}
