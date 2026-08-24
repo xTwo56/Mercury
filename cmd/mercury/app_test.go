@@ -55,7 +55,6 @@ func TestRunApplicationStartupFailures(t *testing.T) {
 		name         string
 		dependencies applicationDependencies
 		wantCause    error
-		wantClosed   *fakeDatabase
 	}{
 		{
 			name: "open database",
@@ -79,8 +78,8 @@ func TestRunApplicationStartupFailures(t *testing.T) {
 				db := &fakeDatabase{}
 				return applicationDependencies{
 					openDatabase: func(context.Context, string) (database, error) { return db, nil },
-					buildRecovery: func(database, config, *slog.Logger) (recoveryRunner, error) {
-						return nil, buildFailure
+					buildServices: func(database, config, *slog.Logger) (applicationServices, error) {
+						return applicationServices{}, buildFailure
 					},
 				}
 			}(),
@@ -141,10 +140,16 @@ func TestRunApplicationValidatesBeforeOpeningDatabase(t *testing.T) {
 
 func validConfig() config {
 	return config{
-		DatabaseURL:        "postgres://user:secret@database/mercury",
-		RecoveryInterval:   defaultRecoveryInterval,
-		RecoveryRetryDelay: defaultRecoveryRetryDelay,
-		RecoveryBatchSize:  defaultRecoveryBatchSize,
+		DatabaseURL:           "postgres://user:secret@database/mercury",
+		RecoveryInterval:      defaultRecoveryInterval,
+		RecoveryRetryDelay:    defaultRecoveryRetryDelay,
+		RecoveryBatchSize:     defaultRecoveryBatchSize,
+		HTTPListenAddress:     defaultHTTPListenAddress,
+		HTTPReadTimeout:       defaultHTTPReadTimeout,
+		HTTPReadHeaderTimeout: defaultHTTPHeaderTimeout,
+		HTTPWriteTimeout:      defaultHTTPWriteTimeout,
+		HTTPIdleTimeout:       defaultHTTPIdleTimeout,
+		HTTPShutdownTimeout:   defaultHTTPShutdownTimeout,
 	}
 }
 
@@ -155,8 +160,8 @@ func discardLogger() *slog.Logger {
 func fakeDependencies(db *fakeDatabase, runner recoveryRunner) applicationDependencies {
 	return applicationDependencies{
 		openDatabase: func(context.Context, string) (database, error) { return db, nil },
-		buildRecovery: func(database, config, *slog.Logger) (recoveryRunner, error) {
-			return runner, nil
+		buildServices: func(database, config, *slog.Logger) (applicationServices, error) {
+			return applicationServices{recovery: runner, http: runner}, nil
 		},
 	}
 }

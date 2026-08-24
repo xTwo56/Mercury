@@ -24,19 +24,38 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if configuration.RecoveryRetryDelay != defaultRecoveryRetryDelay {
 		t.Errorf("RecoveryRetryDelay = %v, want %v", configuration.RecoveryRetryDelay, defaultRecoveryRetryDelay)
 	}
+	if configuration.HTTPListenAddress != defaultHTTPListenAddress ||
+		configuration.HTTPReadTimeout != defaultHTTPReadTimeout ||
+		configuration.HTTPReadHeaderTimeout != defaultHTTPHeaderTimeout ||
+		configuration.HTTPWriteTimeout != defaultHTTPWriteTimeout ||
+		configuration.HTTPIdleTimeout != defaultHTTPIdleTimeout ||
+		configuration.HTTPShutdownTimeout != defaultHTTPShutdownTimeout {
+		t.Errorf("HTTP defaults = %#v, want configured defaults", configuration)
+	}
 }
 
 func TestLoadConfigOverrides(t *testing.T) {
 	configuration, err := loadConfig(environment(map[string]string{
-		databaseURLEnvironment:      "postgres://database/mercury",
-		recoveryIntervalEnvironment: "30s",
-		recoveryBatchEnvironment:    "25",
+		databaseURLEnvironment:         "postgres://database/mercury",
+		recoveryIntervalEnvironment:    "30s",
+		recoveryBatchEnvironment:       "25",
+		httpListenEnvironment:          "127.0.0.1:9090",
+		httpReadTimeoutEnvironment:     "2s",
+		httpHeaderTimeoutEnvironment:   "3s",
+		httpWriteTimeoutEnvironment:    "4s",
+		httpIdleTimeoutEnvironment:     "5s",
+		httpShutdownTimeoutEnvironment: "6s",
 	}))
 	if err != nil {
 		t.Fatalf("loadConfig() error = %v", err)
 	}
 	if configuration.RecoveryInterval != 30*time.Second || configuration.RecoveryBatchSize != 25 {
 		t.Errorf("loadConfig() = %#v, want interval 30s and batch 25", configuration)
+	}
+	if configuration.HTTPListenAddress != "127.0.0.1:9090" || configuration.HTTPReadTimeout != 2*time.Second ||
+		configuration.HTTPReadHeaderTimeout != 3*time.Second || configuration.HTTPWriteTimeout != 4*time.Second ||
+		configuration.HTTPIdleTimeout != 5*time.Second || configuration.HTTPShutdownTimeout != 6*time.Second {
+		t.Errorf("HTTP overrides = %#v, want configured address and timeouts", configuration)
 	}
 }
 
@@ -54,6 +73,12 @@ func TestLoadConfigValidation(t *testing.T) {
 		{name: "zero batch", values: map[string]string{databaseURLEnvironment: "postgres://database/db", recoveryBatchEnvironment: "0"}},
 		{name: "negative batch", values: map[string]string{databaseURLEnvironment: "postgres://database/db", recoveryBatchEnvironment: "-1"}},
 		{name: "oversized batch", values: map[string]string{databaseURLEnvironment: "postgres://database/db", recoveryBatchEnvironment: "1001"}},
+		{name: "invalid HTTP read timeout", values: map[string]string{databaseURLEnvironment: "postgres://database/db", httpReadTimeoutEnvironment: "slow"}},
+		{name: "zero HTTP read timeout", values: map[string]string{databaseURLEnvironment: "postgres://database/db", httpReadTimeoutEnvironment: "0s"}},
+		{name: "negative HTTP header timeout", values: map[string]string{databaseURLEnvironment: "postgres://database/db", httpHeaderTimeoutEnvironment: "-1s"}},
+		{name: "zero HTTP write timeout", values: map[string]string{databaseURLEnvironment: "postgres://database/db", httpWriteTimeoutEnvironment: "0s"}},
+		{name: "zero HTTP idle timeout", values: map[string]string{databaseURLEnvironment: "postgres://database/db", httpIdleTimeoutEnvironment: "0s"}},
+		{name: "zero HTTP shutdown timeout", values: map[string]string{databaseURLEnvironment: "postgres://database/db", httpShutdownTimeoutEnvironment: "0s"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
