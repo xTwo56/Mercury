@@ -1136,7 +1136,7 @@ func TestJobRepositoryIntegration(t *testing.T) {
 			{name: "retry before current time", now: recoveryNow, retryAt: recoveryNow.Add(-time.Nanosecond), batchSize: 1},
 			{name: "zero batch", now: recoveryNow, retryAt: recoveryRetryAt},
 			{name: "negative batch", now: recoveryNow, retryAt: recoveryRetryAt, batchSize: -1},
-			{name: "oversized batch", now: recoveryNow, retryAt: recoveryRetryAt, batchSize: maxRecoveryBatchSize + 1},
+			{name: "oversized batch", now: recoveryNow, retryAt: recoveryRetryAt, batchSize: MaxRecoveryBatchSize + 1},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {

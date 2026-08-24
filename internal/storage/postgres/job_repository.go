@@ -21,7 +21,8 @@ var ErrJobNotFound = errors.New("job not found")
 // ErrNoJobAvailable indicates that no job is currently eligible to be claimed.
 var ErrNoJobAvailable = errors.New("no job available")
 
-const maxRecoveryBatchSize = 1000
+// MaxRecoveryBatchSize is the largest batch accepted by expired-lease recovery.
+const MaxRecoveryBatchSize = 1000
 
 type transactionalDB interface {
 	generated.DBTX
@@ -318,8 +319,8 @@ func (r *JobRepository) RecoverExpiredLeases(ctx context.Context, now, retryAt t
 	if !retryAt.After(now) {
 		return nil, errors.New("recover expired leases: retry time must be after current time")
 	}
-	if batchSize <= 0 || batchSize > maxRecoveryBatchSize {
-		return nil, fmt.Errorf("recover expired leases: batch size must be between 1 and %d", maxRecoveryBatchSize)
+	if batchSize <= 0 || batchSize > MaxRecoveryBatchSize {
+		return nil, fmt.Errorf("recover expired leases: batch size must be between 1 and %d", MaxRecoveryBatchSize)
 	}
 
 	postgresBatchSize, err := postgresInteger(batchSize)
