@@ -3,10 +3,12 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/xtwo56/mercury/internal/job"
 	"github.com/xtwo56/mercury/internal/storage/postgres"
 )
 
@@ -20,6 +22,10 @@ const (
 	httpWriteTimeoutEnvironment    = "MERCURY_HTTP_WRITE_TIMEOUT"
 	httpIdleTimeoutEnvironment     = "MERCURY_HTTP_IDLE_TIMEOUT"
 	httpShutdownTimeoutEnvironment = "MERCURY_HTTP_SHUTDOWN_TIMEOUT"
+	workerIDEnvironment            = "MERCURY_WORKER_ID"
+	workerConcurrencyEnvironment   = "MERCURY_WORKER_CONCURRENCY"
+	workerPollIntervalEnvironment  = "MERCURY_WORKER_POLL_INTERVAL"
+	workerLeaseDurationEnvironment = "MERCURY_WORKER_LEASE_DURATION"
 
 	defaultRecoveryInterval    = time.Minute
 	defaultRecoveryRetryDelay  = time.Minute
@@ -30,6 +36,10 @@ const (
 	defaultHTTPWriteTimeout    = 30 * time.Second
 	defaultHTTPIdleTimeout     = time.Minute
 	defaultHTTPShutdownTimeout = 10 * time.Second
+	defaultWorkerConcurrency   = 4
+	defaultWorkerPollInterval  = time.Second
+	defaultWorkerLeaseDuration = 25 * time.Hour
+	defaultWorkerRetryDelay    = time.Minute
 )
 
 type config struct {
@@ -43,6 +53,11 @@ type config struct {
 	HTTPWriteTimeout      time.Duration
 	HTTPIdleTimeout       time.Duration
 	HTTPShutdownTimeout   time.Duration
+	WorkerID              job.WorkerID
+	WorkerConcurrency     int
+	WorkerPollInterval    time.Duration
+	WorkerLeaseDuration   time.Duration
+	WorkerRetryDelay      time.Duration
 }
 
 func loadConfig(getenv func(string) string) (config, error) {
@@ -83,6 +98,22 @@ func loadConfig(getenv func(string) string) (config, error) {
 	if httpListenAddress == "" {
 		httpListenAddress = defaultHTTPListenAddress
 	}
+	workerID := job.WorkerID(strings.TrimSpace(getenv(workerIDEnvironment)))
+	if workerID == "" {
+		workerID = defaultWorkerID()
+	}
+	workerConcurrency, err := environmentInteger(getenv, workerConcurrencyEnvironment, defaultWorkerConcurrency)
+	if err != nil {
+		return config{}, err
+	}
+	workerPollInterval, err := environmentDuration(getenv, workerPollIntervalEnvironment, defaultWorkerPollInterval)
+	if err != nil {
+		return config{}, err
+	}
+	workerLeaseDuration, err := environmentDuration(getenv, workerLeaseDurationEnvironment, defaultWorkerLeaseDuration)
+	if err != nil {
+		return config{}, err
+	}
 
 	loaded := config{
 		DatabaseURL:           databaseURL,
@@ -95,6 +126,9 @@ func loadConfig(getenv func(string) string) (config, error) {
 		HTTPWriteTimeout:      httpWriteTimeout,
 		HTTPIdleTimeout:       httpIdleTimeout,
 		HTTPShutdownTimeout:   httpShutdownTimeout,
+		WorkerID:              workerID, WorkerConcurrency: workerConcurrency,
+		WorkerPollInterval: workerPollInterval, WorkerLeaseDuration: workerLeaseDuration,
+		WorkerRetryDelay: defaultWorkerRetryDelay,
 	}
 	if err := loaded.validate(); err != nil {
 		return config{}, err
@@ -121,7 +155,24 @@ func (configuration config) validate() error {
 	if configuration.HTTPReadTimeout <= 0 || configuration.HTTPReadHeaderTimeout <= 0 || configuration.HTTPWriteTimeout <= 0 || configuration.HTTPIdleTimeout <= 0 || configuration.HTTPShutdownTimeout <= 0 {
 		return errors.New("HTTP server timeouts must be positive")
 	}
+	if configuration.WorkerID == "" {
+		return errors.New("worker ID must not be empty")
+	}
+	if configuration.WorkerConcurrency <= 0 {
+		return errors.New("worker concurrency must be positive")
+	}
+	if configuration.WorkerPollInterval <= 0 || configuration.WorkerLeaseDuration <= 0 || configuration.WorkerRetryDelay <= 0 {
+		return errors.New("worker timing values must be positive")
+	}
 	return nil
+}
+
+func defaultWorkerID() job.WorkerID {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = "localhost"
+	}
+	return job.WorkerID(fmt.Sprintf("%s-%d", hostname, os.Getpid()))
 }
 
 func environmentDuration(getenv func(string) string, name string, defaultValue time.Duration) (time.Duration, error) {

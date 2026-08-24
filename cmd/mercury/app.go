@@ -15,6 +15,7 @@ import (
 	"github.com/xtwo56/mercury/internal/storage/postgres"
 	"github.com/xtwo56/mercury/internal/storage/postgres/generated"
 	"github.com/xtwo56/mercury/internal/task"
+	"github.com/xtwo56/mercury/internal/worker"
 )
 
 type database interface {
@@ -37,6 +38,7 @@ type applicationServices struct {
 	recovery recoveryRunner
 	http     recoveryRunner
 	handlers *task.HandlerRegistry
+	worker   recoveryRunner
 }
 
 func productionDependencies() applicationDependencies {
@@ -66,6 +68,14 @@ func productionDependencies() applicationDependencies {
 				return applicationServices{}, err
 			}
 			handlers.Seal()
+			workerCoordinator, err := worker.NewCoordinator(repository, handlers, worker.NewSystemClock(), worker.RandomTokenGenerator{}, logger, worker.Config{
+				WorkerID: configuration.WorkerID, Concurrency: configuration.WorkerConcurrency,
+				PollInterval: configuration.WorkerPollInterval, LeaseDuration: configuration.WorkerLeaseDuration,
+				RetryDelay: configuration.WorkerRetryDelay,
+			}, func(err error) bool { return errors.Is(err, postgres.ErrNoJobAvailable) })
+			if err != nil {
+				return applicationServices{}, err
+			}
 			jobs, err := jobapp.NewJobService(repository, registry, jobapp.SystemClock{}, jobapp.RandomIDGenerator{}, func(err error) bool {
 				return errors.Is(err, postgres.ErrJobNotFound)
 			})
@@ -83,7 +93,7 @@ func productionDependencies() applicationDependencies {
 			if err != nil {
 				return applicationServices{}, err
 			}
-			return applicationServices{recovery: recovery, http: httpServer, handlers: handlers}, nil
+			return applicationServices{recovery: recovery, http: httpServer, handlers: handlers, worker: workerCoordinator}, nil
 		},
 	}
 }
@@ -117,12 +127,13 @@ func runApplication(ctx context.Context, configuration config, logger *slog.Logg
 		name string
 		err  error
 	}
-	results := make(chan serviceResult, 2)
+	results := make(chan serviceResult, 3)
 	go func() { results <- serviceResult{name: "recovery service", err: services.recovery.Run(serviceCtx)} }()
 	go func() { results <- serviceResult{name: "HTTP service", err: services.http.Run(serviceCtx)} }()
+	go func() { results <- serviceResult{name: "worker service", err: services.worker.Run(serviceCtx)} }()
 
 	var failure error
-	for range 2 {
+	for range 3 {
 		result := <-results
 		if ctx.Err() == nil && failure == nil {
 			if result.err != nil {

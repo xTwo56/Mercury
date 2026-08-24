@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/xtwo56/mercury/internal/storage/postgres"
+	"github.com/xtwo56/mercury/internal/task"
 )
 
 func TestLoadConfigDefaults(t *testing.T) {
@@ -31,6 +32,13 @@ func TestLoadConfigDefaults(t *testing.T) {
 		configuration.HTTPIdleTimeout != defaultHTTPIdleTimeout ||
 		configuration.HTTPShutdownTimeout != defaultHTTPShutdownTimeout {
 		t.Errorf("HTTP defaults = %#v, want configured defaults", configuration)
+	}
+	if configuration.WorkerID == "" || configuration.WorkerConcurrency != defaultWorkerConcurrency ||
+		configuration.WorkerPollInterval != defaultWorkerPollInterval || configuration.WorkerLeaseDuration != defaultWorkerLeaseDuration {
+		t.Errorf("worker defaults = %#v, want non-empty identity and configured defaults", configuration)
+	}
+	if configuration.WorkerLeaseDuration <= time.Duration(task.MaxSleepDurationMS)*time.Millisecond {
+		t.Errorf("default worker lease %v must exceed maximum sleep duration", configuration.WorkerLeaseDuration)
 	}
 }
 
@@ -79,6 +87,10 @@ func TestLoadConfigValidation(t *testing.T) {
 		{name: "zero HTTP write timeout", values: map[string]string{databaseURLEnvironment: "postgres://database/db", httpWriteTimeoutEnvironment: "0s"}},
 		{name: "zero HTTP idle timeout", values: map[string]string{databaseURLEnvironment: "postgres://database/db", httpIdleTimeoutEnvironment: "0s"}},
 		{name: "zero HTTP shutdown timeout", values: map[string]string{databaseURLEnvironment: "postgres://database/db", httpShutdownTimeoutEnvironment: "0s"}},
+		{name: "zero worker concurrency", values: map[string]string{databaseURLEnvironment: "postgres://database/db", workerConcurrencyEnvironment: "0"}},
+		{name: "invalid worker concurrency", values: map[string]string{databaseURLEnvironment: "postgres://database/db", workerConcurrencyEnvironment: "many"}},
+		{name: "zero worker poll interval", values: map[string]string{databaseURLEnvironment: "postgres://database/db", workerPollIntervalEnvironment: "0s"}},
+		{name: "zero worker lease duration", values: map[string]string{databaseURLEnvironment: "postgres://database/db", workerLeaseDurationEnvironment: "0s"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

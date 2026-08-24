@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/xtwo56/mercury/internal/job"
 )
 
 func TestProductionDatabaseIntegration(t *testing.T) {
@@ -150,6 +151,9 @@ func validConfig() config {
 		HTTPWriteTimeout:      defaultHTTPWriteTimeout,
 		HTTPIdleTimeout:       defaultHTTPIdleTimeout,
 		HTTPShutdownTimeout:   defaultHTTPShutdownTimeout,
+		WorkerID:              job.WorkerID("worker-test"), WorkerConcurrency: defaultWorkerConcurrency,
+		WorkerPollInterval: defaultWorkerPollInterval, WorkerLeaseDuration: defaultWorkerLeaseDuration,
+		WorkerRetryDelay: defaultWorkerRetryDelay,
 	}
 }
 
@@ -161,7 +165,7 @@ func fakeDependencies(db *fakeDatabase, runner recoveryRunner) applicationDepend
 	return applicationDependencies{
 		openDatabase: func(context.Context, string) (database, error) { return db, nil },
 		buildServices: func(database, config, *slog.Logger) (applicationServices, error) {
-			return applicationServices{recovery: runner, http: runner}, nil
+			return applicationServices{recovery: runner, http: runner, worker: runner}, nil
 		},
 	}
 }
