@@ -131,3 +131,40 @@ SET state = sqlc.arg(state),
     lease_token = NULL,
     lease_expires_at = NULL
 WHERE id = sqlc.arg(id);
+
+-- name: GetExpiredLeasesForUpdate :many
+SELECT
+    id,
+    task_type,
+    payload,
+    state,
+    max_attempts,
+    attempts_started,
+    created_at,
+    available_at,
+    lease_worker_id,
+    lease_token,
+    lease_expires_at,
+    started_at,
+    result,
+    completed_at,
+    last_error,
+    failed_at
+FROM jobs
+WHERE state IN ('leased', 'running')
+  AND lease_expires_at <= sqlc.arg(now)
+ORDER BY lease_expires_at, created_at, id
+LIMIT sqlc.arg(batch_size)
+FOR UPDATE SKIP LOCKED;
+
+-- name: RecoverExpiredJob :execrows
+UPDATE jobs
+SET state = sqlc.arg(state),
+    available_at = sqlc.arg(available_at),
+    started_at = sqlc.arg(started_at),
+    last_error = sqlc.arg(last_error),
+    failed_at = sqlc.arg(failed_at),
+    lease_worker_id = NULL,
+    lease_token = NULL,
+    lease_expires_at = NULL
+WHERE id = sqlc.arg(id);

@@ -1,0 +1,1 @@
+DROP INDEX jobs_expired_lease_recovery_idx;

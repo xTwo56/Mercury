@@ -130,6 +130,14 @@ func TestJobRecoverExpiredLease(t *testing.T) {
 		}
 		return job
 	}
+	runningJobWithExistingData := func(t *testing.T) Job {
+		t.Helper()
+		job := runningJob(t, 3)
+		completedAt := claimTime.Add(-time.Hour)
+		job.Result = json.RawMessage(`{"previous":"result"}`)
+		job.CompletedAt = &completedAt
+		return job
+	}
 
 	tests := []struct {
 		name          string
@@ -143,6 +151,7 @@ func TestJobRecoverExpiredLease(t *testing.T) {
 		{name: "leased recovery at exact expiry", prepare: func(t *testing.T) Job { return leasedJob(t, 3) }, now: recoveryTime, wantState: StateQueued, wantAvailable: recoveryTime.UTC()},
 		{name: "leased recovery after expiry", prepare: func(t *testing.T) Job { return leasedJob(t, 3) }, now: recoveryTime.Add(time.Second), wantState: StateQueued, wantAvailable: recoveryTime.Add(time.Second).UTC()},
 		{name: "running retry", prepare: func(t *testing.T) Job { return runningJob(t, 3) }, now: recoveryTime, retryAt: retryAt, wantState: StateRetryScheduled, wantAvailable: retryAt.UTC()},
+		{name: "running preserves existing data", prepare: runningJobWithExistingData, now: recoveryTime, retryAt: retryAt, wantState: StateRetryScheduled, wantAvailable: retryAt.UTC()},
 		{name: "running exhausted", prepare: func(t *testing.T) Job { return runningJob(t, 1) }, now: recoveryTime, wantState: StateFailed},
 		{name: "before expiry", prepare: func(t *testing.T) Job { return runningJob(t, 3) }, now: expiresAt.Add(-time.Nanosecond), retryAt: retryAt, wantErr: true},
 		{name: "zero current time", prepare: func(t *testing.T) Job { return runningJob(t, 3) }, retryAt: retryAt, wantErr: true},
@@ -186,6 +195,10 @@ func TestJobRecoverExpiredLease(t *testing.T) {
 			if job.AttemptsStarted != before.AttemptsStarted {
 				t.Errorf("Job.AttemptsStarted = %d, want unchanged value %d", job.AttemptsStarted, before.AttemptsStarted)
 			}
+			if job.ID != before.ID || job.TaskType != before.TaskType || !reflect.DeepEqual(job.Payload, before.Payload) ||
+				!reflect.DeepEqual(job.Result, before.Result) || !reflect.DeepEqual(job.CompletedAt, before.CompletedAt) {
+				t.Errorf("RecoverExpiredLease() changed submitted or completion data: got %#v, want %#v", job, before)
+			}
 			if !tt.wantAvailable.IsZero() && !job.AvailableAt.Equal(tt.wantAvailable) {
 				t.Errorf("Job.AvailableAt = %v, want %v", job.AvailableAt, tt.wantAvailable)
 			}
@@ -201,8 +214,8 @@ func TestJobRecoverExpiredLease(t *testing.T) {
 			if job.StartedAt != nil {
 				t.Errorf("Job.StartedAt = %v, want nil", job.StartedAt)
 			}
-			if job.LastError != "lease expired" {
-				t.Errorf("Job.LastError = %q, want %q", job.LastError, "lease expired")
+			if job.LastError != leaseExpiredFailure {
+				t.Errorf("Job.LastError = %q, want %q", job.LastError, leaseExpiredFailure)
 			}
 			wantFailedAt := tt.now.UTC()
 			if job.FailedAt == nil || !job.FailedAt.Equal(wantFailedAt) || job.FailedAt.Location() != time.UTC {
@@ -215,7 +228,7 @@ func TestJobRecoverExpiredLease(t *testing.T) {
 	}
 }
 
-func TestJobRejectsStaleCompletionAfterLeaseRecovery(t *testing.T) {
+func TestJobRejectsStaleWorkerOperationsAfterLeaseRecovery(t *testing.T) {
 	claimTime := time.Date(2026, time.August, 16, 8, 0, 0, 0, time.UTC)
 	expiresAt := claimTime.Add(5 * time.Minute)
 	retryAt := expiresAt.Add(time.Minute)
@@ -241,14 +254,41 @@ func TestJobRejectsStaleCompletionAfterLeaseRecovery(t *testing.T) {
 			if err := job.RecoverExpiredLease(expiresAt, retryAt); err != nil {
 				t.Fatalf("RecoverExpiredLease() error = %v", err)
 			}
-			before := cloneExecutionJob(job)
 
-			err := job.Complete(WorkerID("worker-1"), LeaseToken("token-1"), expiresAt.Add(time.Nanosecond), json.RawMessage(`{}`))
-			if err == nil {
-				t.Fatal("Complete() error = nil, want stale completion rejected")
+			operations := []struct {
+				name string
+				call func(*Job) error
+			}{
+				{
+					name: "heartbeat",
+					call: func(job *Job) error {
+						return job.RenewLease(WorkerID("worker-1"), LeaseToken("token-1"), expiresAt.Add(time.Nanosecond), expiresAt.Add(time.Hour))
+					},
+				},
+				{
+					name: "completion",
+					call: func(job *Job) error {
+						return job.Complete(WorkerID("worker-1"), LeaseToken("token-1"), expiresAt.Add(time.Nanosecond), json.RawMessage(`{}`))
+					},
+				},
+				{
+					name: "failure",
+					call: func(job *Job) error {
+						return job.Fail(WorkerID("worker-1"), LeaseToken("token-1"), expiresAt.Add(time.Nanosecond), "stale failure", &retryAt)
+					},
+				},
 			}
-			if !reflect.DeepEqual(job, before) {
-				t.Errorf("Complete() mutated recovered job: got %#v, want %#v", job, before)
+
+			for _, operation := range operations {
+				t.Run(operation.name, func(t *testing.T) {
+					before := cloneExecutionJob(job)
+					if err := operation.call(&job); err == nil {
+						t.Fatalf("stale %s error = nil, want rejection", operation.name)
+					}
+					if !reflect.DeepEqual(job, before) {
+						t.Errorf("stale %s mutated recovered job: got %#v, want %#v", operation.name, job, before)
+					}
+				})
 			}
 		})
 	}

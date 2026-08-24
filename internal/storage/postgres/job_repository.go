@@ -21,6 +21,8 @@ var ErrJobNotFound = errors.New("job not found")
 // ErrNoJobAvailable indicates that no job is currently eligible to be claimed.
 var ErrNoJobAvailable = errors.New("no job available")
 
+const maxRecoveryBatchSize = 1000
+
 type transactionalDB interface {
 	generated.DBTX
 	Begin(context.Context) (pgx.Tx, error)
@@ -303,6 +305,74 @@ func (r *JobRepository) FailExecution(ctx context.Context, jobID job.JobID, work
 		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("fail job %q: commit transaction: %w", jobID, err))
 	}
 	return failed, nil
+}
+
+// RecoverExpiredLeases atomically recovers a bounded batch of expired leases.
+func (r *JobRepository) RecoverExpiredLeases(ctx context.Context, now, retryAt time.Time, batchSize int) ([]job.Job, error) {
+	if now.IsZero() {
+		return nil, errors.New("recover expired leases: current time must not be zero")
+	}
+	if retryAt.IsZero() {
+		return nil, errors.New("recover expired leases: retry time must not be zero")
+	}
+	if !retryAt.After(now) {
+		return nil, errors.New("recover expired leases: retry time must be after current time")
+	}
+	if batchSize <= 0 || batchSize > maxRecoveryBatchSize {
+		return nil, fmt.Errorf("recover expired leases: batch size must be between 1 and %d", maxRecoveryBatchSize)
+	}
+
+	postgresBatchSize, err := postgresInteger(batchSize)
+	if err != nil {
+		return nil, fmt.Errorf("recover expired leases: batch size: %w", err)
+	}
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("recover expired leases: begin transaction: %w", err)
+	}
+
+	queries := r.queries.WithTx(tx)
+	// Locks are acquired in stable order while SKIP LOCKED lets independent
+	// recovery processes divide work without waiting for one another.
+	rows, err := queries.GetExpiredLeasesForUpdate(ctx, generated.GetExpiredLeasesForUpdateParams{
+		Now:       timestamptz(now),
+		BatchSize: postgresBatchSize,
+	})
+	if err != nil {
+		return nil, rollbackTransaction(ctx, tx, fmt.Errorf("recover expired leases: select candidates: %w", err))
+	}
+
+	recovered := make([]job.Job, 0, len(rows))
+	for _, row := range rows {
+		candidate, err := jobFromRow(row)
+		if err != nil {
+			return nil, rollbackTransaction(ctx, tx, fmt.Errorf("recover expired leases: decode candidate: %w", err))
+		}
+		if err := candidate.RecoverExpiredLease(now, retryAt); err != nil {
+			return nil, rollbackTransaction(ctx, tx, fmt.Errorf("recover expired job %q: validate: %w", candidate.ID, err))
+		}
+
+		rowsAffected, err := queries.RecoverExpiredJob(ctx, generated.RecoverExpiredJobParams{
+			ID:          string(candidate.ID),
+			State:       string(candidate.State),
+			AvailableAt: timestamptz(candidate.AvailableAt),
+			StartedAt:   nullableTimestamptz(candidate.StartedAt),
+			LastError:   nullableString(candidate.LastError),
+			FailedAt:    nullableTimestamptz(candidate.FailedAt),
+		})
+		if err != nil {
+			return nil, rollbackTransaction(ctx, tx, fmt.Errorf("recover expired job %q: persist: %w", candidate.ID, err))
+		}
+		if rowsAffected != 1 {
+			return nil, rollbackTransaction(ctx, tx, fmt.Errorf("recover expired job %q: persist affected %d rows", candidate.ID, rowsAffected))
+		}
+		recovered = append(recovered, candidate)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, rollbackTransaction(ctx, tx, fmt.Errorf("recover expired leases: commit transaction: %w", err))
+	}
+	return recovered, nil
 }
 
 func rollbackTransaction(ctx context.Context, tx pgx.Tx, cause error) error {

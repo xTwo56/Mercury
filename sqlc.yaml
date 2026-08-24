@@ -1,7 +1,9 @@
 version: "2"
 sql:
   - engine: "postgresql"
-    schema: "migrations/000001_create_jobs.up.sql"
+    schema:
+      - "migrations/000001_create_jobs.up.sql"
+      - "migrations/000002_index_expired_job_leases.up.sql"
     queries: "internal/storage/postgres/queries/jobs.sql"
     gen:
       go:

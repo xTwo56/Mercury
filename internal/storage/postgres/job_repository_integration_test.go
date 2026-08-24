@@ -48,12 +48,14 @@ func TestJobRepositoryIntegration(t *testing.T) {
 		t.Fatalf("set test search path: %v", err)
 	}
 
-	migration, err := os.ReadFile(upMigrationPath(t))
-	if err != nil {
-		t.Fatalf("read jobs migration: %v", err)
-	}
-	if _, err := conn.Exec(ctx, string(migration)); err != nil {
-		t.Fatalf("apply jobs migration: %v", err)
+	for _, migrationPath := range upMigrationPaths(t) {
+		migration, err := os.ReadFile(migrationPath)
+		if err != nil {
+			t.Fatalf("read migration %s: %v", migrationPath, err)
+		}
+		if _, err := conn.Exec(ctx, string(migration)); err != nil {
+			t.Fatalf("apply migration %s: %v", migrationPath, err)
+		}
 	}
 
 	repository := NewJobRepository(conn)
@@ -1011,6 +1013,271 @@ func TestJobRepositoryIntegration(t *testing.T) {
 		}
 		assertJobEqual(t, afterRejections, normalizedJob(accepted))
 	})
+
+	recoveryNow := startLeaseExpiresAt.Add(time.Minute)
+	recoveryRetryAt := recoveryNow.Add(10 * time.Minute)
+	expiredJob := func(id string, state job.State, attemptsStarted, maxAttempts int, expiresAt time.Time) job.Job {
+		j := leasableJob(id, state, attemptsStarted, maxAttempts, expiresAt)
+		if state == job.StateRunning {
+			startedAt := expiresAt.Add(-time.Minute)
+			j.StartedAt = &startedAt
+		}
+		return j
+	}
+
+	t.Run("recover expired lease outcomes", func(t *testing.T) {
+		truncateJobs(t)
+		leased := expiredJob("recover-leased", job.StateLeased, 0, 3, recoveryNow)
+		running := expiredJob("recover-running", job.StateRunning, 1, 3, recoveryNow.Add(-time.Second))
+		running.Payload = json.RawMessage(`{"preserved":true}`)
+		exhausted := expiredJob("recover-exhausted", job.StateRunning, 2, 2, recoveryNow.Add(-2*time.Second))
+		for _, j := range []job.Job{leased, running, exhausted} {
+			if err := repository.Create(ctx, j); err != nil {
+				t.Fatalf("Create(%q) error = %v", j.ID, err)
+			}
+		}
+
+		recovered, err := repository.RecoverExpiredLeases(ctx, recoveryNow, recoveryRetryAt, 10)
+		if err != nil {
+			t.Fatalf("RecoverExpiredLeases() error = %v", err)
+		}
+		if len(recovered) != 3 {
+			t.Fatalf("RecoverExpiredLeases() count = %d, want 3", len(recovered))
+		}
+		if recovered[0].ID != exhausted.ID || recovered[1].ID != running.ID || recovered[2].ID != leased.ID {
+			t.Errorf("recovery order = [%q %q %q], want [%q %q %q]", recovered[0].ID, recovered[1].ID, recovered[2].ID, exhausted.ID, running.ID, leased.ID)
+		}
+
+		for _, want := range []job.Job{leased, running, exhausted} {
+			persisted, err := repository.GetByID(ctx, want.ID)
+			if err != nil {
+				t.Fatalf("GetByID(%q) error = %v", want.ID, err)
+			}
+			if persisted.Lease != nil {
+				t.Errorf("GetByID(%q) lease = %#v, want nil", want.ID, persisted.Lease)
+			}
+			if persisted.AttemptsStarted != want.AttemptsStarted || persisted.TaskType != want.TaskType || !jsonEqual(persisted.Payload, want.Payload) {
+				t.Errorf("GetByID(%q) changed attempts or submitted data: got %#v, want %#v", want.ID, persisted, want)
+			}
+			switch want.ID {
+			case leased.ID:
+				if persisted.State != job.StateQueued || !persisted.AvailableAt.Equal(recoveryNow) || persisted.LastError != "" || persisted.FailedAt != nil {
+					t.Errorf("leased recovery = %#v, want queued and immediately available without failure", persisted)
+				}
+			case running.ID:
+				if persisted.State != job.StateRetryScheduled || !persisted.AvailableAt.Equal(recoveryRetryAt) || persisted.LastError != "lease expired" || persisted.FailedAt == nil || !persisted.FailedAt.Equal(recoveryNow) || persisted.StartedAt != nil {
+					t.Errorf("running recovery = %#v, want scheduled retry with expiry failure", persisted)
+				}
+			case exhausted.ID:
+				if persisted.State != job.StateFailed || persisted.LastError != "lease expired" || persisted.FailedAt == nil || !persisted.FailedAt.Equal(recoveryNow) || persisted.StartedAt != nil {
+					t.Errorf("exhausted recovery = %#v, want terminal expiry failure", persisted)
+				}
+			}
+			if persisted.FailedAt != nil && persisted.FailedAt.Location() != time.UTC {
+				t.Errorf("GetByID(%q) FailedAt location = %v, want UTC", want.ID, persisted.FailedAt.Location())
+			}
+		}
+
+		immediate, err := repository.ClaimNext(ctx, job.WorkerID("worker-2"), job.LeaseToken("token-2"), recoveryRetryAt.Add(-time.Microsecond), recoveryRetryAt.Add(time.Minute))
+		if err != nil {
+			t.Fatalf("ClaimNext() immediate recovery error = %v", err)
+		}
+		if immediate.ID != leased.ID {
+			t.Errorf("ClaimNext() before retry ID = %q, want immediately queued %q", immediate.ID, leased.ID)
+		}
+		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-3"), job.LeaseToken("token-3"), recoveryRetryAt, recoveryRetryAt.Add(time.Minute))
+		if err != nil {
+			t.Fatalf("ClaimNext() scheduled recovery error = %v", err)
+		}
+		if claimed.ID != running.ID {
+			t.Errorf("ClaimNext() scheduled ID = %q, want %q", claimed.ID, running.ID)
+		}
+	})
+
+	t.Run("recovery skips ineligible jobs and handles empty queue", func(t *testing.T) {
+		truncateJobs(t)
+		unexpired := expiredJob("recover-unexpired", job.StateRunning, 1, 3, recoveryNow.Add(time.Microsecond))
+		queued := integrationJob("recover-queued", recoveryNow.Add(-time.Hour))
+		succeeded := integrationJob("recover-succeeded", recoveryNow.Add(-time.Hour))
+		succeeded.State = job.StateSucceeded
+		succeeded.AttemptsStarted = 1
+		for _, j := range []job.Job{unexpired, queued, succeeded} {
+			if err := repository.Create(ctx, j); err != nil {
+				t.Fatalf("Create(%q) error = %v", j.ID, err)
+			}
+		}
+
+		recovered, err := repository.RecoverExpiredLeases(ctx, recoveryNow, recoveryRetryAt, 10)
+		if err != nil {
+			t.Fatalf("RecoverExpiredLeases() error = %v", err)
+		}
+		if recovered == nil || len(recovered) != 0 {
+			t.Errorf("RecoverExpiredLeases() = %#v, want non-nil empty slice", recovered)
+		}
+		for _, want := range []job.Job{unexpired, queued, succeeded} {
+			persisted, err := repository.GetByID(ctx, want.ID)
+			if err != nil {
+				t.Fatalf("GetByID(%q) error = %v", want.ID, err)
+			}
+			assertJobEqual(t, persisted, normalizedJob(want))
+		}
+	})
+
+	t.Run("recovery validates timestamps and batch size", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			now       time.Time
+			retryAt   time.Time
+			batchSize int
+		}{
+			{name: "zero current time", retryAt: recoveryRetryAt, batchSize: 1},
+			{name: "zero retry time", now: recoveryNow, batchSize: 1},
+			{name: "retry equal to current time", now: recoveryNow, retryAt: recoveryNow, batchSize: 1},
+			{name: "retry before current time", now: recoveryNow, retryAt: recoveryNow.Add(-time.Nanosecond), batchSize: 1},
+			{name: "zero batch", now: recoveryNow, retryAt: recoveryRetryAt},
+			{name: "negative batch", now: recoveryNow, retryAt: recoveryRetryAt, batchSize: -1},
+			{name: "oversized batch", now: recoveryNow, retryAt: recoveryRetryAt, batchSize: maxRecoveryBatchSize + 1},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				if _, err := repository.RecoverExpiredLeases(ctx, tt.now, tt.retryAt, tt.batchSize); err == nil {
+					t.Fatal("RecoverExpiredLeases() error = nil, want validation error")
+				}
+			})
+		}
+	})
+
+	t.Run("recovery enforces batch size and deterministic ties", func(t *testing.T) {
+		truncateJobs(t)
+		first := expiredJob("recover-order-b", job.StateLeased, 0, 3, recoveryNow.Add(-time.Minute))
+		first.CreatedAt = recoveryNow.Add(-3 * time.Hour)
+		second := expiredJob("recover-order-a", job.StateLeased, 0, 3, recoveryNow)
+		second.CreatedAt = recoveryNow.Add(-2 * time.Hour)
+		third := expiredJob("recover-order-b2", job.StateLeased, 0, 3, recoveryNow)
+		third.CreatedAt = second.CreatedAt
+		for _, j := range []job.Job{third, second, first} {
+			if err := repository.Create(ctx, j); err != nil {
+				t.Fatalf("Create(%q) error = %v", j.ID, err)
+			}
+		}
+
+		recovered, err := repository.RecoverExpiredLeases(ctx, recoveryNow, recoveryRetryAt, 2)
+		if err != nil {
+			t.Fatalf("RecoverExpiredLeases() error = %v", err)
+		}
+		if len(recovered) != 2 || recovered[0].ID != first.ID || recovered[1].ID != second.ID {
+			t.Errorf("RecoverExpiredLeases() IDs = %#v, want [%q %q]", recovered, first.ID, second.ID)
+		}
+		persistedThird, err := repository.GetByID(ctx, third.ID)
+		if err != nil {
+			t.Fatalf("GetByID(%q) error = %v", third.ID, err)
+		}
+		if persistedThird.State != job.StateLeased || persistedThird.Lease == nil {
+			t.Errorf("job outside batch = %#v, want unchanged leased job", persistedThird)
+		}
+	})
+
+	t.Run("stale worker operations fail after recovery", func(t *testing.T) {
+		truncateJobs(t)
+		running := expiredJob("recover-stale", job.StateRunning, 1, 3, recoveryNow)
+		if err := repository.Create(ctx, running); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		if _, err := repository.RecoverExpiredLeases(ctx, recoveryNow, recoveryRetryAt, 1); err != nil {
+			t.Fatalf("RecoverExpiredLeases() error = %v", err)
+		}
+		before, err := repository.GetByID(ctx, running.ID)
+		if err != nil {
+			t.Fatalf("GetByID() error = %v", err)
+		}
+
+		operations := []struct {
+			name string
+			call func() error
+		}{
+			{name: "heartbeat", call: func() error {
+				_, err := repository.RenewLease(ctx, running.ID, running.Lease.WorkerID, running.Lease.Token, recoveryNow.Add(time.Second), recoveryRetryAt.Add(time.Minute))
+				return err
+			}},
+			{name: "completion", call: func() error {
+				_, err := repository.CompleteExecution(ctx, running.ID, running.Lease.WorkerID, running.Lease.Token, json.RawMessage(`null`), recoveryNow.Add(time.Second))
+				return err
+			}},
+			{name: "failure", call: func() error {
+				_, err := repository.FailExecution(ctx, running.ID, running.Lease.WorkerID, running.Lease.Token, recoveryNow.Add(time.Second), "stale", &recoveryRetryAt)
+				return err
+			}},
+		}
+		for _, operation := range operations {
+			t.Run(operation.name, func(t *testing.T) {
+				if err := operation.call(); err == nil {
+					t.Fatalf("stale %s error = nil, want rejection", operation.name)
+				}
+				after, err := repository.GetByID(ctx, running.ID)
+				if err != nil {
+					t.Fatalf("GetByID() error = %v", err)
+				}
+				assertJobEqual(t, after, before)
+			})
+		}
+	})
+
+	t.Run("concurrent recoveries process disjoint jobs", func(t *testing.T) {
+		truncateJobs(t)
+		const jobCount = 4
+		for index := range jobCount {
+			j := expiredJob("recover-concurrent-"+string(rune('a'+index)), job.StateLeased, 0, 3, recoveryNow.Add(-time.Duration(index)*time.Second))
+			if err := repository.Create(ctx, j); err != nil {
+				t.Fatalf("Create(%q) error = %v", j.ID, err)
+			}
+		}
+
+		secondConn, err := pgx.Connect(ctx, databaseURL)
+		if err != nil {
+			t.Fatalf("connect second recovery process: %v", err)
+		}
+		defer func() {
+			if err := secondConn.Close(ctx); err != nil {
+				t.Errorf("close second recovery connection: %v", err)
+			}
+		}()
+		if _, err := secondConn.Exec(ctx, "SET search_path TO "+qualifiedSchema); err != nil {
+			t.Fatalf("set second recovery search path: %v", err)
+		}
+		secondRepository := NewJobRepository(secondConn)
+
+		type recoveryResult struct {
+			jobs []job.Job
+			err  error
+		}
+		start := make(chan struct{})
+		results := make(chan recoveryResult, 2)
+		recoverBatch := func(repository *JobRepository) {
+			<-start
+			jobs, err := repository.RecoverExpiredLeases(ctx, recoveryNow, recoveryRetryAt, 2)
+			results <- recoveryResult{jobs: jobs, err: err}
+		}
+		go recoverBatch(repository)
+		go recoverBatch(secondRepository)
+		close(start)
+
+		seen := make(map[job.JobID]struct{}, jobCount)
+		for range 2 {
+			result := <-results
+			if result.err != nil {
+				t.Fatalf("RecoverExpiredLeases() concurrent error = %v", result.err)
+			}
+			for _, recovered := range result.jobs {
+				if _, duplicate := seen[recovered.ID]; duplicate {
+					t.Errorf("job %q recovered by both processes", recovered.ID)
+				}
+				seen[recovered.ID] = struct{}{}
+			}
+		}
+		if len(seen) != jobCount {
+			t.Errorf("concurrent recovered count = %d, want %d", len(seen), jobCount)
+		}
+	})
 }
 
 func integrationJob(id string, createdAt time.Time) job.Job {
@@ -1070,11 +1337,18 @@ func jsonEqual(left, right json.RawMessage) bool {
 	return reflect.DeepEqual(leftValue, rightValue)
 }
 
-func upMigrationPath(t *testing.T) string {
+func upMigrationPaths(t *testing.T) []string {
 	t.Helper()
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("resolve integration test path")
 	}
-	return filepath.Join(filepath.Dir(filename), "..", "..", "..", "migrations", "000001_create_jobs.up.sql")
+	paths, err := filepath.Glob(filepath.Join(filepath.Dir(filename), "..", "..", "..", "migrations", "*.up.sql"))
+	if err != nil {
+		t.Fatalf("find up migrations: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no up migrations found")
+	}
+	return paths
 }

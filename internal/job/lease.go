@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+const leaseExpiredFailure = "lease expired"
+
 type (
 	WorkerID   string
 	LeaseToken string
@@ -101,7 +103,7 @@ func (j *Job) RecoverExpiredLease(now, retryAt time.Time) error {
 	}
 
 	failedAt := now.UTC()
-	j.LastError = "lease expired"
+	j.LastError = leaseExpiredFailure
 	j.FailedAt = &failedAt
 	j.Lease = nil
 	j.StartedAt = nil
