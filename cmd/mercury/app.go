@@ -30,15 +30,17 @@ type recoveryRunner interface {
 }
 
 type applicationDependencies struct {
-	openDatabase  func(context.Context, string) (database, error)
-	buildServices func(database, config, *slog.Logger) (applicationServices, error)
+	openDatabase   func(context.Context, string) (database, error)
+	buildAPI       func(database, config, *slog.Logger) (serviceRunner, error)
+	buildScheduler func(database, config, *slog.Logger) (serviceRunner, error)
+	buildWorker    func(database, config, *slog.Logger) (serviceRunner, error)
 }
 
-type applicationServices struct {
-	recovery recoveryRunner
-	http     recoveryRunner
-	handlers *task.HandlerRegistry
-	worker   recoveryRunner
+type serviceRunner interface{ Run(context.Context) error }
+
+type namedService struct {
+	name   string
+	runner serviceRunner
 }
 
 func productionDependencies() applicationDependencies {
@@ -46,29 +48,26 @@ func productionDependencies() applicationDependencies {
 		openDatabase: func(ctx context.Context, databaseURL string) (database, error) {
 			return pgxpool.New(ctx, databaseURL)
 		},
-		buildServices: func(db database, configuration config, logger *slog.Logger) (applicationServices, error) {
+		buildScheduler: func(db database, configuration config, logger *slog.Logger) (serviceRunner, error) {
 			repository := postgres.NewJobRepository(db)
-			recovery, err := scheduler.NewRecoveryService(repository, scheduler.NewSystemClock(), logger, scheduler.RecoveryConfig{
+			return scheduler.NewRecoveryService(repository, scheduler.NewSystemClock(), logger, scheduler.RecoveryConfig{
 				SweepInterval: configuration.RecoveryInterval,
 				RetryDelay:    configuration.RecoveryRetryDelay,
 				BatchSize:     configuration.RecoveryBatchSize,
 			})
-			if err != nil {
-				return applicationServices{}, err
-			}
-			registry := task.NewRegistry(map[job.TaskType]task.Validator{
-				task.SleepTaskType: task.SleepValidator{},
-			})
+		},
+		buildWorker: func(db database, configuration config, logger *slog.Logger) (serviceRunner, error) {
+			repository := postgres.NewJobRepository(db)
 			handlers := task.NewHandlerRegistry()
 			sleepHandler, err := task.NewSleepHandler(task.NewSystemTimerFactory())
 			if err != nil {
-				return applicationServices{}, err
+				return nil, err
 			}
 			if err := handlers.Register(task.SleepTaskType, sleepHandler); err != nil {
-				return applicationServices{}, err
+				return nil, err
 			}
 			handlers.Seal()
-			workerCoordinator, err := worker.NewCoordinator(repository, handlers, worker.NewSystemClock(), worker.RandomTokenGenerator{}, logger, worker.Config{
+			return worker.NewCoordinator(repository, handlers, worker.NewSystemClock(), worker.RandomTokenGenerator{}, logger, worker.Config{
 				WorkerID: configuration.WorkerID, Concurrency: configuration.WorkerConcurrency,
 				PollInterval: configuration.WorkerPollInterval, LeaseDuration: configuration.WorkerLeaseDuration,
 				RetryDelay: configuration.WorkerRetryDelay, HeartbeatInterval: configuration.WorkerHeartbeatInterval,
@@ -77,16 +76,19 @@ func productionDependencies() applicationDependencies {
 					errors.Is(err, job.ErrLeaseMissing) || errors.Is(err, job.ErrLeaseWorkerMismatch) ||
 					errors.Is(err, job.ErrLeaseTokenMismatch) || errors.Is(err, job.ErrLeaseExpired)
 			})
-			if err != nil {
-				return applicationServices{}, err
-			}
+		},
+		buildAPI: func(db database, configuration config, logger *slog.Logger) (serviceRunner, error) {
+			repository := postgres.NewJobRepository(db)
+			registry := task.NewRegistry(map[job.TaskType]task.Validator{
+				task.SleepTaskType: task.SleepValidator{},
+			})
 			jobs, err := jobapp.NewJobService(repository, registry, jobapp.SystemClock{}, jobapp.RandomIDGenerator{}, func(err error) bool {
 				return errors.Is(err, postgres.ErrJobNotFound)
 			})
 			if err != nil {
-				return applicationServices{}, err
+				return nil, err
 			}
-			httpServer, err := httpapi.NewServer(httpapi.ServerConfig{
+			return httpapi.NewServer(httpapi.ServerConfig{
 				ListenAddress:     configuration.HTTPListenAddress,
 				ReadTimeout:       configuration.HTTPReadTimeout,
 				ReadHeaderTimeout: configuration.HTTPReadHeaderTimeout,
@@ -94,10 +96,6 @@ func productionDependencies() applicationDependencies {
 				IdleTimeout:       configuration.HTTPIdleTimeout,
 				ShutdownTimeout:   configuration.HTTPShutdownTimeout,
 			}, httpapi.NewHandler(jobs), logger)
-			if err != nil {
-				return applicationServices{}, err
-			}
-			return applicationServices{recovery: recovery, http: httpServer, handlers: handlers, worker: workerCoordinator}, nil
 		},
 	}
 }
@@ -116,28 +114,26 @@ func runApplication(ctx context.Context, configuration config, logger *slog.Logg
 		return privateError("verify PostgreSQL connection", err)
 	}
 
-	services, err := dependencies.buildServices(db, configuration, logger)
+	services, err := buildRoleServices(db, configuration, logger, dependencies)
 	if err != nil {
 		return fmt.Errorf("construct application services: %w", err)
 	}
 
-	logger.InfoContext(ctx, "Mercury scheduler started",
-		"recovery_interval", configuration.RecoveryInterval,
-		"recovery_batch_size", configuration.RecoveryBatchSize,
-	)
+	logger.InfoContext(ctx, "Mercury started", "role", configuration.Role)
 	serviceCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	type serviceResult struct {
 		name string
 		err  error
 	}
-	results := make(chan serviceResult, 3)
-	go func() { results <- serviceResult{name: "recovery service", err: services.recovery.Run(serviceCtx)} }()
-	go func() { results <- serviceResult{name: "HTTP service", err: services.http.Run(serviceCtx)} }()
-	go func() { results <- serviceResult{name: "worker service", err: services.worker.Run(serviceCtx)} }()
+	results := make(chan serviceResult, len(services))
+	for _, service := range services {
+		service := service
+		go func() { results <- serviceResult{name: service.name, err: service.runner.Run(serviceCtx)} }()
+	}
 
 	var failure error
-	for range 3 {
+	for range services {
 		result := <-results
 		if ctx.Err() == nil && failure == nil {
 			if result.err != nil {
@@ -153,6 +149,37 @@ func runApplication(ctx context.Context, configuration config, logger *slog.Logg
 	}
 	logger.InfoContext(context.Background(), "Mercury services stopped")
 	return nil
+}
+
+func buildRoleServices(db database, configuration config, logger *slog.Logger, dependencies applicationDependencies) ([]namedService, error) {
+	services := make([]namedService, 0, 3)
+	build := func(enabled bool, name string, factory func(database, config, *slog.Logger) (serviceRunner, error)) error {
+		if !enabled {
+			return nil
+		}
+		if factory == nil {
+			return fmt.Errorf("%s factory is missing", name)
+		}
+		runner, err := factory(db, configuration, logger)
+		if err != nil {
+			return fmt.Errorf("build %s: %w", name, err)
+		}
+		if runner == nil {
+			return fmt.Errorf("build %s: service is nil", name)
+		}
+		services = append(services, namedService{name: name, runner: runner})
+		return nil
+	}
+	if err := build(configuration.Role.includesAPI(), "HTTP service", dependencies.buildAPI); err != nil {
+		return nil, err
+	}
+	if err := build(configuration.Role.includesScheduler(), "recovery service", dependencies.buildScheduler); err != nil {
+		return nil, err
+	}
+	if err := build(configuration.Role.includesWorker(), "worker service", dependencies.buildWorker); err != nil {
+		return nil, err
+	}
+	return services, nil
 }
 
 type privateApplicationError struct {

@@ -13,6 +13,7 @@ import (
 )
 
 const (
+	roleEnvironment                = "MERCURY_ROLE"
 	databaseURLEnvironment         = "MERCURY_DATABASE_URL"
 	recoveryIntervalEnvironment    = "MERCURY_RECOVERY_INTERVAL"
 	recoveryBatchEnvironment       = "MERCURY_RECOVERY_BATCH_SIZE"
@@ -43,7 +44,17 @@ const (
 	defaultWorkerRetryDelay    = time.Minute
 )
 
+type runtimeRole string
+
+const (
+	roleAll       runtimeRole = "all"
+	roleAPI       runtimeRole = "api"
+	roleScheduler runtimeRole = "scheduler"
+	roleWorker    runtimeRole = "worker"
+)
+
 type config struct {
+	Role                    runtimeRole
 	DatabaseURL             string
 	RecoveryInterval        time.Duration
 	RecoveryRetryDelay      time.Duration
@@ -63,81 +74,86 @@ type config struct {
 }
 
 func loadConfig(getenv func(string) string) (config, error) {
+	role, err := parseRole(getenv(roleEnvironment))
+	if err != nil {
+		return config{}, err
+	}
 	databaseURL := strings.TrimSpace(getenv(databaseURLEnvironment))
 	if databaseURL == "" {
 		return config{}, fmt.Errorf("%s is required", databaseURLEnvironment)
 	}
 
-	interval, err := environmentDuration(getenv, recoveryIntervalEnvironment, defaultRecoveryInterval)
-	if err != nil {
-		return config{}, err
+	loaded := config{Role: role, DatabaseURL: databaseURL}
+	if role.includesScheduler() {
+		loaded.RecoveryInterval, err = environmentDuration(getenv, recoveryIntervalEnvironment, defaultRecoveryInterval)
+		if err != nil {
+			return config{}, err
+		}
+		loaded.RecoveryBatchSize, err = environmentInteger(getenv, recoveryBatchEnvironment, defaultRecoveryBatchSize)
+		if err != nil {
+			return config{}, err
+		}
+		loaded.RecoveryRetryDelay = defaultRecoveryRetryDelay
 	}
-	batchSize, err := environmentInteger(getenv, recoveryBatchEnvironment, defaultRecoveryBatchSize)
-	if err != nil {
-		return config{}, err
+	if role.includesAPI() {
+		httpReadTimeout, err := environmentDuration(getenv, httpReadTimeoutEnvironment, defaultHTTPReadTimeout)
+		if err != nil {
+			return config{}, err
+		}
+		httpHeaderTimeout, err := environmentDuration(getenv, httpHeaderTimeoutEnvironment, defaultHTTPHeaderTimeout)
+		if err != nil {
+			return config{}, err
+		}
+		httpWriteTimeout, err := environmentDuration(getenv, httpWriteTimeoutEnvironment, defaultHTTPWriteTimeout)
+		if err != nil {
+			return config{}, err
+		}
+		httpIdleTimeout, err := environmentDuration(getenv, httpIdleTimeoutEnvironment, defaultHTTPIdleTimeout)
+		if err != nil {
+			return config{}, err
+		}
+		httpShutdownTimeout, err := environmentDuration(getenv, httpShutdownTimeoutEnvironment, defaultHTTPShutdownTimeout)
+		if err != nil {
+			return config{}, err
+		}
+		httpListenAddress := strings.TrimSpace(getenv(httpListenEnvironment))
+		if httpListenAddress == "" {
+			httpListenAddress = defaultHTTPListenAddress
+		}
+		loaded.HTTPListenAddress = httpListenAddress
+		loaded.HTTPReadTimeout = httpReadTimeout
+		loaded.HTTPReadHeaderTimeout = httpHeaderTimeout
+		loaded.HTTPWriteTimeout = httpWriteTimeout
+		loaded.HTTPIdleTimeout = httpIdleTimeout
+		loaded.HTTPShutdownTimeout = httpShutdownTimeout
 	}
-	httpReadTimeout, err := environmentDuration(getenv, httpReadTimeoutEnvironment, defaultHTTPReadTimeout)
-	if err != nil {
-		return config{}, err
-	}
-	httpHeaderTimeout, err := environmentDuration(getenv, httpHeaderTimeoutEnvironment, defaultHTTPHeaderTimeout)
-	if err != nil {
-		return config{}, err
-	}
-	httpWriteTimeout, err := environmentDuration(getenv, httpWriteTimeoutEnvironment, defaultHTTPWriteTimeout)
-	if err != nil {
-		return config{}, err
-	}
-	httpIdleTimeout, err := environmentDuration(getenv, httpIdleTimeoutEnvironment, defaultHTTPIdleTimeout)
-	if err != nil {
-		return config{}, err
-	}
-	httpShutdownTimeout, err := environmentDuration(getenv, httpShutdownTimeoutEnvironment, defaultHTTPShutdownTimeout)
-	if err != nil {
-		return config{}, err
-	}
-	httpListenAddress := strings.TrimSpace(getenv(httpListenEnvironment))
-	if httpListenAddress == "" {
-		httpListenAddress = defaultHTTPListenAddress
-	}
-	workerID := job.WorkerID(strings.TrimSpace(getenv(workerIDEnvironment)))
-	if workerID == "" {
-		workerID = defaultWorkerID()
-	}
-	workerConcurrency, err := environmentInteger(getenv, workerConcurrencyEnvironment, defaultWorkerConcurrency)
-	if err != nil {
-		return config{}, err
-	}
-	workerPollInterval, err := environmentDuration(getenv, workerPollIntervalEnvironment, defaultWorkerPollInterval)
-	if err != nil {
-		return config{}, err
-	}
-	workerLeaseDuration, err := environmentDuration(getenv, workerLeaseDurationEnvironment, defaultWorkerLeaseDuration)
-	if err != nil {
-		return config{}, err
-	}
-	workerHeartbeatInterval, err := environmentDuration(getenv, workerHeartbeatEnvironment, workerLeaseDuration/3)
-	if err != nil {
-		return config{}, err
-	}
-
-	loaded := config{
-		DatabaseURL:             databaseURL,
-		RecoveryInterval:        interval,
-		RecoveryRetryDelay:      defaultRecoveryRetryDelay,
-		RecoveryBatchSize:       batchSize,
-		HTTPListenAddress:       httpListenAddress,
-		HTTPReadTimeout:         httpReadTimeout,
-		HTTPReadHeaderTimeout:   httpHeaderTimeout,
-		HTTPWriteTimeout:        httpWriteTimeout,
-		HTTPIdleTimeout:         httpIdleTimeout,
-		HTTPShutdownTimeout:     httpShutdownTimeout,
-		WorkerID:                workerID,
-		WorkerConcurrency:       workerConcurrency,
-		WorkerPollInterval:      workerPollInterval,
-		WorkerLeaseDuration:     workerLeaseDuration,
-		WorkerRetryDelay:        defaultWorkerRetryDelay,
-		WorkerHeartbeatInterval: workerHeartbeatInterval,
+	if role.includesWorker() {
+		workerID := job.WorkerID(strings.TrimSpace(getenv(workerIDEnvironment)))
+		if workerID == "" {
+			workerID = defaultWorkerID()
+		}
+		workerConcurrency, err := environmentInteger(getenv, workerConcurrencyEnvironment, defaultWorkerConcurrency)
+		if err != nil {
+			return config{}, err
+		}
+		workerPollInterval, err := environmentDuration(getenv, workerPollIntervalEnvironment, defaultWorkerPollInterval)
+		if err != nil {
+			return config{}, err
+		}
+		workerLeaseDuration, err := environmentDuration(getenv, workerLeaseDurationEnvironment, defaultWorkerLeaseDuration)
+		if err != nil {
+			return config{}, err
+		}
+		workerHeartbeatInterval, err := environmentDuration(getenv, workerHeartbeatEnvironment, workerLeaseDuration/3)
+		if err != nil {
+			return config{}, err
+		}
+		loaded.WorkerID = workerID
+		loaded.WorkerConcurrency = workerConcurrency
+		loaded.WorkerPollInterval = workerPollInterval
+		loaded.WorkerLeaseDuration = workerLeaseDuration
+		loaded.WorkerRetryDelay = defaultWorkerRetryDelay
+		loaded.WorkerHeartbeatInterval = workerHeartbeatInterval
 	}
 	if err := loaded.validate(); err != nil {
 		return config{}, err
@@ -145,35 +161,55 @@ func loadConfig(getenv func(string) string) (config, error) {
 	return loaded, nil
 }
 
+func parseRole(value string) (runtimeRole, error) {
+	switch role := runtimeRole(strings.ToLower(strings.TrimSpace(value))); role {
+	case "", roleAll:
+		return roleAll, nil
+	case roleAPI, roleScheduler, roleWorker:
+		return role, nil
+	default:
+		return "", fmt.Errorf("%s must be one of all, api, scheduler, or worker", roleEnvironment)
+	}
+}
+
+func (role runtimeRole) includesAPI() bool       { return role == roleAll || role == roleAPI }
+func (role runtimeRole) includesScheduler() bool { return role == roleAll || role == roleScheduler }
+func (role runtimeRole) includesWorker() bool    { return role == roleAll || role == roleWorker }
+
 func (configuration config) validate() error {
 	if strings.TrimSpace(configuration.DatabaseURL) == "" {
 		return errors.New("PostgreSQL connection string is required")
 	}
-	if configuration.RecoveryInterval <= 0 {
+	switch configuration.Role {
+	case roleAll, roleAPI, roleScheduler, roleWorker:
+	default:
+		return errors.New("runtime role is invalid")
+	}
+	if configuration.Role.includesScheduler() && configuration.RecoveryInterval <= 0 {
 		return errors.New("recovery interval must be positive")
 	}
-	if configuration.RecoveryRetryDelay <= 0 {
+	if configuration.Role.includesScheduler() && configuration.RecoveryRetryDelay <= 0 {
 		return errors.New("recovery retry delay must be positive")
 	}
-	if configuration.RecoveryBatchSize <= 0 || configuration.RecoveryBatchSize > postgres.MaxRecoveryBatchSize {
+	if configuration.Role.includesScheduler() && (configuration.RecoveryBatchSize <= 0 || configuration.RecoveryBatchSize > postgres.MaxRecoveryBatchSize) {
 		return fmt.Errorf("recovery batch size must be between 1 and %d", postgres.MaxRecoveryBatchSize)
 	}
-	if strings.TrimSpace(configuration.HTTPListenAddress) == "" {
+	if configuration.Role.includesAPI() && strings.TrimSpace(configuration.HTTPListenAddress) == "" {
 		return errors.New("HTTP listen address must not be empty")
 	}
-	if configuration.HTTPReadTimeout <= 0 || configuration.HTTPReadHeaderTimeout <= 0 || configuration.HTTPWriteTimeout <= 0 || configuration.HTTPIdleTimeout <= 0 || configuration.HTTPShutdownTimeout <= 0 {
+	if configuration.Role.includesAPI() && (configuration.HTTPReadTimeout <= 0 || configuration.HTTPReadHeaderTimeout <= 0 || configuration.HTTPWriteTimeout <= 0 || configuration.HTTPIdleTimeout <= 0 || configuration.HTTPShutdownTimeout <= 0) {
 		return errors.New("HTTP server timeouts must be positive")
 	}
-	if configuration.WorkerID == "" {
+	if configuration.Role.includesWorker() && strings.TrimSpace(string(configuration.WorkerID)) == "" {
 		return errors.New("worker ID must not be empty")
 	}
-	if configuration.WorkerConcurrency <= 0 {
+	if configuration.Role.includesWorker() && configuration.WorkerConcurrency <= 0 {
 		return errors.New("worker concurrency must be positive")
 	}
-	if configuration.WorkerPollInterval <= 0 || configuration.WorkerLeaseDuration <= 0 || configuration.WorkerRetryDelay <= 0 {
+	if configuration.Role.includesWorker() && (configuration.WorkerPollInterval <= 0 || configuration.WorkerLeaseDuration <= 0 || configuration.WorkerRetryDelay <= 0) {
 		return errors.New("worker timing values must be positive")
 	}
-	if configuration.WorkerHeartbeatInterval <= 0 || configuration.WorkerHeartbeatInterval >= configuration.WorkerLeaseDuration/2 {
+	if configuration.Role.includesWorker() && (configuration.WorkerHeartbeatInterval <= 0 || configuration.WorkerHeartbeatInterval >= configuration.WorkerLeaseDuration/2) {
 		return errors.New("worker heartbeat interval must be positive and leave sufficient lease-renewal margin")
 	}
 	return nil

@@ -16,6 +16,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig() error = %v", err)
 	}
+	if configuration.Role != roleAll {
+		t.Errorf("Role = %q, want %q", configuration.Role, roleAll)
+	}
 	if configuration.RecoveryInterval != defaultRecoveryInterval {
 		t.Errorf("RecoveryInterval = %v, want %v", configuration.RecoveryInterval, defaultRecoveryInterval)
 	}
@@ -80,6 +83,7 @@ func TestLoadConfigValidation(t *testing.T) {
 	}{
 		{name: "missing database URL", values: map[string]string{}},
 		{name: "blank database URL", values: map[string]string{databaseURLEnvironment: "  "}},
+		{name: "invalid role", values: map[string]string{databaseURLEnvironment: "postgres://database/db", roleEnvironment: "other"}},
 		{name: "invalid interval", values: map[string]string{databaseURLEnvironment: "postgres://database/db", recoveryIntervalEnvironment: "often"}},
 		{name: "zero interval", values: map[string]string{databaseURLEnvironment: "postgres://database/db", recoveryIntervalEnvironment: "0s"}},
 		{name: "negative interval", values: map[string]string{databaseURLEnvironment: "postgres://database/db", recoveryIntervalEnvironment: "-1s"}},
@@ -117,6 +121,64 @@ func TestLoadConfigValidation(t *testing.T) {
 
 	if postgres.MaxRecoveryBatchSize != 1000 {
 		t.Errorf("MaxRecoveryBatchSize = %d, update oversized fixture", postgres.MaxRecoveryBatchSize)
+	}
+}
+
+func TestRoleParsingAndRelevantConfiguration(t *testing.T) {
+	for _, role := range []runtimeRole{roleAPI, roleScheduler, roleWorker, roleAll} {
+		t.Run(string(role), func(t *testing.T) {
+			configuration, err := loadConfig(environment(map[string]string{
+				databaseURLEnvironment:        "postgres://database/db",
+				roleEnvironment:               string(role),
+				httpReadTimeoutEnvironment:    map[bool]string{true: "bad"}[!role.includesAPI()],
+				recoveryIntervalEnvironment:   map[bool]string{true: "bad"}[!role.includesScheduler()],
+				workerPollIntervalEnvironment: map[bool]string{true: "bad"}[!role.includesWorker()],
+			}))
+			if err != nil {
+				t.Fatalf("loadConfig() error = %v", err)
+			}
+			if configuration.Role != role {
+				t.Errorf("Role = %q, want %q", configuration.Role, role)
+			}
+			if !role.includesAPI() && (configuration.HTTPListenAddress != "" || configuration.HTTPReadTimeout != 0) {
+				t.Errorf("excluded API configuration was loaded: %#v", configuration)
+			}
+			if !role.includesScheduler() && configuration.RecoveryInterval != 0 {
+				t.Errorf("excluded scheduler configuration was loaded: %#v", configuration)
+			}
+			if !role.includesWorker() && configuration.WorkerID != "" {
+				t.Errorf("excluded worker configuration was loaded: %#v", configuration)
+			}
+		})
+	}
+}
+
+func TestConfigValidationIsRoleSpecific(t *testing.T) {
+	tests := []struct {
+		name       string
+		role       runtimeRole
+		invalidate func(*config)
+		wantError  bool
+	}{
+		{name: "api ignores scheduler", role: roleAPI, invalidate: func(c *config) { c.RecoveryInterval = 0 }},
+		{name: "api ignores worker", role: roleAPI, invalidate: func(c *config) { c.WorkerID = "" }},
+		{name: "scheduler ignores HTTP", role: roleScheduler, invalidate: func(c *config) { c.HTTPListenAddress = "" }},
+		{name: "scheduler ignores worker", role: roleScheduler, invalidate: func(c *config) { c.WorkerID = "" }},
+		{name: "worker ignores HTTP", role: roleWorker, invalidate: func(c *config) { c.HTTPListenAddress = "" }},
+		{name: "worker ignores scheduler", role: roleWorker, invalidate: func(c *config) { c.RecoveryInterval = 0 }},
+		{name: "worker requires ID", role: roleWorker, invalidate: func(c *config) { c.WorkerID = "" }, wantError: true},
+		{name: "all requires ID", role: roleAll, invalidate: func(c *config) { c.WorkerID = "" }, wantError: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configuration := validConfig()
+			configuration.Role = tt.role
+			tt.invalidate(&configuration)
+			err := configuration.validate()
+			if (err != nil) != tt.wantError {
+				t.Errorf("validate() error = %v, wantError %v", err, tt.wantError)
+			}
+		})
 	}
 }
 
