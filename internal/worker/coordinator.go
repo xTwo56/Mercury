@@ -211,6 +211,11 @@ func (coordinator *Coordinator) heartbeat(ctx context.Context, cancelExecution c
 			}
 			renewed, err := coordinator.repository.RenewLease(ctx, started.ID, coordinator.config.WorkerID, token, now, proposed)
 			if err != nil {
+				// A renewal interrupted by this heartbeat's intentional shutdown is
+				// lifecycle coordination, not an operational renewal failure.
+				if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+					return heartbeatOutcome{confirmedExpiration: confirmed}
+				}
 				if coordinator.isOwnershipLost(err) || !coordinator.clock.Now().Before(confirmed) {
 					cancelExecution()
 					return heartbeatOutcome{confirmedExpiration: confirmed, ownershipLost: true}

@@ -1,12 +1,14 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -198,6 +200,75 @@ func TestCoordinatorHeartbeatRenewalAndOwnershipLoss(t *testing.T) {
 	}
 }
 
+func TestCoordinatorHeartbeatCancellationDuringRenewal(t *testing.T) {
+	repository := &fakeRepository{
+		jobs:         []job.Job{workerJob("job-1", task.SleepTaskType)},
+		renewStarted: make(chan struct{}, 1),
+		renewExited:  make(chan struct{}, 1),
+	}
+	handler := &blockingHandler{entered: make(chan struct{}, 1), release: make(chan struct{}, 1)}
+	coordinator, clock := testCoordinatorWithHandler(t, repository, handler, 1)
+	var logs bytes.Buffer
+	coordinator.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	receiveSignal(t, handler.entered)
+	heartbeatTicker := receiveTicker(t, clock.heartbeatCreated)
+	clock.setNow(time.Date(2026, 8, 24, 12, 10, 0, 0, time.UTC))
+	heartbeatTicker.ticks <- clock.Now()
+	receiveSignal(t, repository.renewStarted)
+
+	// Handler completion cancels the heartbeat while its repository call is
+	// blocked. The fake returns the same wrapped cancellation as pgx would.
+	handler.release <- struct{}{}
+	receiveSignal(t, repository.renewExited)
+	receiveSignal(t, repository.completed)
+	cancel()
+	receiveError(t, done)
+
+	if repository.renewCount() != 1 || repository.completeCalls != 1 || repository.failCalls != 0 {
+		t.Errorf("renew/complete/fail = %d/%d/%d, want 1/1/0", repository.renewCount(), repository.completeCalls, repository.failCalls)
+	}
+	if repository.completeContextErr != nil {
+		t.Errorf("terminal persistence context error = %v", repository.completeContextErr)
+	}
+	if strings.Contains(logs.String(), "renew job lease") {
+		t.Errorf("intentional heartbeat cancellation logged as renewal failure: %s", logs.String())
+	}
+	if !heartbeatTicker.stopped {
+		t.Error("heartbeat ticker was not stopped")
+	}
+	heartbeatTicker.ticks <- clock.Now()
+	if repository.renewCount() != 1 {
+		t.Errorf("renewals after terminal persistence = %d, want 1", repository.renewCount())
+	}
+}
+
+func TestCoordinatorLogsGenuineHeartbeatFailure(t *testing.T) {
+	repository := &fakeRepository{jobs: []job.Job{workerJob("job-1", task.SleepTaskType)}, renewErrors: []error{errors.New("database unavailable")}, renewed: make(chan struct{}, 1)}
+	handler := &blockingHandler{entered: make(chan struct{}, 1), release: make(chan struct{}, 1)}
+	coordinator, clock := testCoordinatorWithHandler(t, repository, handler, 1)
+	var logs bytes.Buffer
+	coordinator.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	receiveSignal(t, handler.entered)
+	heartbeatTicker := receiveTicker(t, clock.heartbeatCreated)
+	clock.setNow(time.Date(2026, 8, 24, 12, 10, 0, 0, time.UTC))
+	heartbeatTicker.ticks <- clock.Now()
+	receiveSignal(t, repository.renewed)
+	handler.release <- struct{}{}
+	receiveSignal(t, repository.completed)
+	cancel()
+	receiveError(t, done)
+	if !strings.Contains(logs.String(), "renew job lease") || !strings.Contains(logs.String(), "database unavailable") {
+		t.Errorf("genuine renewal failure was not logged: %s", logs.String())
+	}
+}
+
 func testCoordinator(t *testing.T, repository *fakeRepository, handler *fakeHandler, concurrency int) (*Coordinator, *fakeClock) {
 	return testCoordinatorWithHandler(t, repository, handler, concurrency)
 }
@@ -252,6 +323,9 @@ type fakeRepository struct {
 	renewErrors                          []error
 	renewCalls                           []renewCall
 	renewed                              chan struct{}
+	renewStarted                         chan struct{}
+	renewExited                          chan struct{}
+	completeContextErr                   error
 }
 
 func (r *fakeRepository) ClaimNext(_ context.Context, _ job.WorkerID, token job.LeaseToken, _, _ time.Time) (job.Job, error) {
@@ -276,10 +350,11 @@ func (r *fakeRepository) StartExecution(_ context.Context, id job.JobID, _ job.W
 	}
 	return r.claimed[id], nil
 }
-func (r *fakeRepository) CompleteExecution(_ context.Context, id job.JobID, _ job.WorkerID, _ job.LeaseToken, result json.RawMessage, _ time.Time) (job.Job, error) {
+func (r *fakeRepository) CompleteExecution(ctx context.Context, id job.JobID, _ job.WorkerID, _ job.LeaseToken, result json.RawMessage, _ time.Time) (job.Job, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.completeCalls++
+	r.completeContextErr = ctx.Err()
 	r.signalCompleted()
 	r.signalFinished()
 	return job.Job{ID: id, Result: result}, r.completeError
@@ -298,17 +373,28 @@ type renewCall struct {
 	now, expiresAt time.Time
 }
 
-func (r *fakeRepository) RenewLease(_ context.Context, id job.JobID, workerID job.WorkerID, token job.LeaseToken, now time.Time, expiresAt time.Time) (job.Job, error) {
+func (r *fakeRepository) RenewLease(ctx context.Context, id job.JobID, workerID job.WorkerID, token job.LeaseToken, now time.Time, expiresAt time.Time) (job.Job, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.renewCalls = append(r.renewCalls, renewCall{workerID: workerID, token: token, now: now, expiresAt: expiresAt})
 	var err error
 	if len(r.renewErrors) > 0 {
 		err = r.renewErrors[0]
 		r.renewErrors = r.renewErrors[1:]
 	}
-	if r.renewed != nil {
-		r.renewed <- struct{}{}
+	renewedSignal := r.renewed
+	startedSignal := r.renewStarted
+	exitedSignal := r.renewExited
+	r.mu.Unlock()
+	if startedSignal != nil {
+		startedSignal <- struct{}{}
+		<-ctx.Done()
+		err = fmt.Errorf("begin renewal transaction: %w", ctx.Err())
+	}
+	if exitedSignal != nil {
+		exitedSignal <- struct{}{}
+	}
+	if renewedSignal != nil {
+		renewedSignal <- struct{}{}
 	}
 	if err != nil {
 		return job.Job{}, err
