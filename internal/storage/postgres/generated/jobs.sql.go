@@ -42,6 +42,86 @@ func (q *Queries) CompleteJob(ctx context.Context, arg CompleteJobParams) (int64
 	return result.RowsAffected(), nil
 }
 
+const createIdempotentJob = `-- name: CreateIdempotentJob :one
+INSERT INTO jobs (
+    id, task_type, payload, state, max_attempts, attempts_started,
+    created_at, available_at, lease_worker_id, lease_token,
+    lease_expires_at, started_at, result, completed_at, last_error, failed_at,
+    idempotency_key, idempotency_fingerprint
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9,
+    $10, $11, $12, $13, $14, $15, $16, $17, $18
+)
+ON CONFLICT (idempotency_key) DO NOTHING
+RETURNING id, task_type, payload, state, max_attempts, attempts_started, created_at, available_at, lease_worker_id, lease_token, lease_expires_at, started_at, result, completed_at, last_error, failed_at, idempotency_key, idempotency_fingerprint
+`
+
+type CreateIdempotentJobParams struct {
+	ID                     string
+	TaskType               string
+	Payload                []byte
+	State                  string
+	MaxAttempts            int32
+	AttemptsStarted        int32
+	CreatedAt              pgtype.Timestamptz
+	AvailableAt            pgtype.Timestamptz
+	LeaseWorkerID          *string
+	LeaseToken             *string
+	LeaseExpiresAt         pgtype.Timestamptz
+	StartedAt              pgtype.Timestamptz
+	Result                 []byte
+	CompletedAt            pgtype.Timestamptz
+	LastError              *string
+	FailedAt               pgtype.Timestamptz
+	IdempotencyKey         []byte
+	IdempotencyFingerprint []byte
+}
+
+func (q *Queries) CreateIdempotentJob(ctx context.Context, arg CreateIdempotentJobParams) (Job, error) {
+	row := q.db.QueryRow(ctx, createIdempotentJob,
+		arg.ID,
+		arg.TaskType,
+		arg.Payload,
+		arg.State,
+		arg.MaxAttempts,
+		arg.AttemptsStarted,
+		arg.CreatedAt,
+		arg.AvailableAt,
+		arg.LeaseWorkerID,
+		arg.LeaseToken,
+		arg.LeaseExpiresAt,
+		arg.StartedAt,
+		arg.Result,
+		arg.CompletedAt,
+		arg.LastError,
+		arg.FailedAt,
+		arg.IdempotencyKey,
+		arg.IdempotencyFingerprint,
+	)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.TaskType,
+		&i.Payload,
+		&i.State,
+		&i.MaxAttempts,
+		&i.AttemptsStarted,
+		&i.CreatedAt,
+		&i.AvailableAt,
+		&i.LeaseWorkerID,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.StartedAt,
+		&i.Result,
+		&i.CompletedAt,
+		&i.LastError,
+		&i.FailedAt,
+		&i.IdempotencyKey,
+		&i.IdempotencyFingerprint,
+	)
+	return i, err
+}
+
 const createJob = `-- name: CreateJob :exec
 INSERT INTO jobs (
     id,
@@ -159,7 +239,9 @@ SELECT
     result,
     completed_at,
     last_error,
-    failed_at
+    failed_at,
+    idempotency_key,
+    idempotency_fingerprint
 FROM jobs
 WHERE state IN ('leased', 'running')
   AND lease_expires_at <= $1
@@ -199,6 +281,8 @@ func (q *Queries) GetExpiredLeasesForUpdate(ctx context.Context, arg GetExpiredL
 			&i.CompletedAt,
 			&i.LastError,
 			&i.FailedAt,
+			&i.IdempotencyKey,
+			&i.IdempotencyFingerprint,
 		); err != nil {
 			return nil, err
 		}
@@ -227,7 +311,9 @@ SELECT
     result,
     completed_at,
     last_error,
-    failed_at
+    failed_at,
+    idempotency_key,
+    idempotency_fingerprint
 FROM jobs
 WHERE id = $1
 `
@@ -252,6 +338,8 @@ func (q *Queries) GetJobByID(ctx context.Context, id string) (Job, error) {
 		&i.CompletedAt,
 		&i.LastError,
 		&i.FailedAt,
+		&i.IdempotencyKey,
+		&i.IdempotencyFingerprint,
 	)
 	return i, err
 }
@@ -273,7 +361,9 @@ SELECT
     result,
     completed_at,
     last_error,
-    failed_at
+    failed_at,
+    idempotency_key,
+    idempotency_fingerprint
 FROM jobs
 WHERE id = $1
 FOR UPDATE
@@ -299,6 +389,41 @@ func (q *Queries) GetJobByIDForUpdate(ctx context.Context, id string) (Job, erro
 		&i.CompletedAt,
 		&i.LastError,
 		&i.FailedAt,
+		&i.IdempotencyKey,
+		&i.IdempotencyFingerprint,
+	)
+	return i, err
+}
+
+const getJobByIdempotencyKeyForUpdate = `-- name: GetJobByIdempotencyKeyForUpdate :one
+SELECT id, task_type, payload, state, max_attempts, attempts_started, created_at, available_at, lease_worker_id, lease_token, lease_expires_at, started_at, result, completed_at, last_error, failed_at, idempotency_key, idempotency_fingerprint
+FROM jobs
+WHERE idempotency_key = $1
+FOR UPDATE
+`
+
+func (q *Queries) GetJobByIdempotencyKeyForUpdate(ctx context.Context, idempotencyKey []byte) (Job, error) {
+	row := q.db.QueryRow(ctx, getJobByIdempotencyKeyForUpdate, idempotencyKey)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.TaskType,
+		&i.Payload,
+		&i.State,
+		&i.MaxAttempts,
+		&i.AttemptsStarted,
+		&i.CreatedAt,
+		&i.AvailableAt,
+		&i.LeaseWorkerID,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.StartedAt,
+		&i.Result,
+		&i.CompletedAt,
+		&i.LastError,
+		&i.FailedAt,
+		&i.IdempotencyKey,
+		&i.IdempotencyFingerprint,
 	)
 	return i, err
 }
@@ -320,7 +445,9 @@ SELECT
     result,
     completed_at,
     last_error,
-    failed_at
+    failed_at,
+    idempotency_key,
+    idempotency_fingerprint
 FROM jobs
 WHERE state IN ('queued', 'retry_scheduled')
   AND available_at <= $1
@@ -350,6 +477,8 @@ func (q *Queries) GetNextClaimableJobForUpdate(ctx context.Context, now pgtype.T
 		&i.CompletedAt,
 		&i.LastError,
 		&i.FailedAt,
+		&i.IdempotencyKey,
+		&i.IdempotencyFingerprint,
 	)
 	return i, err
 }

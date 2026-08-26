@@ -82,9 +82,10 @@ func productionDependencies() applicationDependencies {
 			registry := task.NewRegistry(map[job.TaskType]task.Validator{
 				task.SleepTaskType: task.SleepValidator{},
 			})
-			jobs, err := jobapp.NewJobService(repository, registry, jobapp.SystemClock{}, jobapp.RandomIDGenerator{}, func(err error) bool {
-				return errors.Is(err, postgres.ErrJobNotFound)
-			})
+			jobs, err := jobapp.NewJobService(repository, registry, jobapp.SystemClock{}, jobapp.RandomIDGenerator{},
+				func(err error) bool { return errors.Is(err, postgres.ErrJobNotFound) },
+				func(err error) bool { return errors.Is(err, postgres.ErrIdempotencyConflict) },
+			)
 			if err != nil {
 				return nil, err
 			}

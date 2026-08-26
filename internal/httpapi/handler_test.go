@@ -58,6 +58,177 @@ func TestHandlerSubmitJob(t *testing.T) {
 	}
 }
 
+func TestHandlerIdempotentSubmission(t *testing.T) {
+	now := time.Date(2026, time.August, 24, 12, 0, 0, 0, time.UTC)
+	body := `{"task_type":"sleep","payload":{"duration_ms":250}}`
+	store := &fakeJobStore{}
+	handler := testHandler(t, store, now)
+
+	first := performRequestWithIdempotencyKey(handler, body, "Case-Sensitive-Key")
+	replay := performRequestWithIdempotencyKey(handler, body, "Case-Sensitive-Key")
+	if first.Code != http.StatusCreated || replay.Code != http.StatusOK {
+		t.Fatalf("first/replay status = %d/%d, want 201/200", first.Code, replay.Code)
+	}
+	if first.Header().Get("Location") != replay.Header().Get("Location") {
+		t.Errorf("first/replay locations differ: %q/%q", first.Header().Get("Location"), replay.Header().Get("Location"))
+	}
+	if len(store.created) != 1 {
+		t.Errorf("created jobs = %d, want 1", len(store.created))
+	}
+
+	store.mu.Lock()
+	existing := store.idempotent["Case-Sensitive-Key"]
+	completedAt := now.Add(time.Minute)
+	existing.job.State = job.StateSucceeded
+	existing.job.AttemptsStarted = 1
+	existing.job.CompletedAt = &completedAt
+	existing.job.Result = json.RawMessage(`{"slept":true}`)
+	store.idempotent["Case-Sensitive-Key"] = existing
+	store.mu.Unlock()
+	completedReplay := performRequestWithIdempotencyKey(handler, body, "Case-Sensitive-Key")
+	if completedReplay.Code != http.StatusOK || !strings.Contains(completedReplay.Body.String(), `"state":"succeeded"`) || !strings.Contains(completedReplay.Body.String(), `"slept":true`) {
+		t.Errorf("completed replay = %d %s", completedReplay.Code, completedReplay.Body.String())
+	}
+}
+
+func TestHandlerSubmissionWithoutIdempotencyAlwaysCreates(t *testing.T) {
+	store := &fakeJobStore{}
+	handler := testHandler(t, store, time.Now().UTC())
+	body := `{"task_type":"sleep","payload":{"duration_ms":1}}`
+	for range 2 {
+		if response := performRequest(handler, http.MethodPost, "/v1/jobs", "application/json", body); response.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", response.Code)
+		}
+	}
+	if len(store.created) != 2 {
+		t.Errorf("created jobs = %d, want 2", len(store.created))
+	}
+}
+
+func TestHandlerIdempotencyConflictAndKeyValidation(t *testing.T) {
+	now := time.Now().UTC()
+	store := &fakeJobStore{}
+	handler := testHandler(t, store, now)
+	if response := performRequestWithIdempotencyKey(handler, `{"task_type":"sleep","payload":{"duration_ms":1}}`, "same-key"); response.Code != http.StatusCreated {
+		t.Fatalf("first status = %d", response.Code)
+	}
+	conflict := performRequestWithIdempotencyKey(handler, `{"task_type":"sleep","payload":{"duration_ms":2}}`, "same-key")
+	if conflict.Code != http.StatusConflict || !strings.Contains(conflict.Body.String(), "idempotency_conflict") {
+		t.Errorf("conflict response = %d %s", conflict.Code, conflict.Body.String())
+	}
+
+	validBody := `{"task_type":"sleep","payload":{"duration_ms":1}}`
+	tests := []struct {
+		name   string
+		values []string
+	}{
+		{name: "empty", values: []string{""}},
+		{name: "whitespace", values: []string{"contains space"}},
+		{name: "control", values: []string{"bad\x01key"}},
+		{name: "oversized", values: []string{strings.Repeat("x", maxIdempotencyKeyBytes+1)}},
+		{name: "multiple", values: []string{"one", "two"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(validBody))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header["Idempotency-Key"] = tt.values
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "invalid_idempotency_key") {
+				t.Errorf("response = %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandlerIdempotencyFingerprintSemantics(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	base := `{"task_type":"sleep","payload":{"duration_ms":1}}`
+	tests := []struct {
+		name       string
+		firstBody  string
+		secondBody string
+		wantStatus int
+	}{
+		{name: "canonical payload", firstBody: base, secondBody: `{ "payload" : { "duration_ms" : 1 }, "task_type" : "sleep" }`, wantStatus: http.StatusOK},
+		{name: "different payload", firstBody: base, secondBody: `{"task_type":"sleep","payload":{"duration_ms":2}}`, wantStatus: http.StatusConflict},
+		{name: "omitted versus explicit attempts", firstBody: base, secondBody: `{"task_type":"sleep","payload":{"duration_ms":1},"max_attempts":3}`, wantStatus: http.StatusConflict},
+		{name: "omitted versus explicit availability", firstBody: base, secondBody: `{"task_type":"sleep","payload":{"duration_ms":1},"available_at":"2026-08-26T12:00:00Z"}`, wantStatus: http.StatusConflict},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeJobStore{}
+			handler := testHandler(t, store, now)
+			if first := performRequestWithIdempotencyKey(handler, tt.firstBody, "fingerprint-key"); first.Code != http.StatusCreated {
+				t.Fatalf("first status = %d", first.Code)
+			}
+			if second := performRequestWithIdempotencyKey(handler, tt.secondBody, "fingerprint-key"); second.Code != tt.wantStatus {
+				t.Errorf("second status = %d, want %d: %s", second.Code, tt.wantStatus, second.Body.String())
+			}
+		})
+	}
+
+	store := &fakeJobStore{}
+	handler := testHandler(t, store, now)
+	if performRequestWithIdempotencyKey(handler, base, "Case").Code != http.StatusCreated || performRequestWithIdempotencyKey(handler, base, "case").Code != http.StatusCreated {
+		t.Error("case-sensitive keys were treated as equal")
+	}
+}
+
+func TestHandlerConcurrentIdempotentSubmissions(t *testing.T) {
+	tests := []struct {
+		name                 string
+		bodies               []string
+		wantOK, wantConflict int
+	}{
+		{name: "identical", bodies: []string{
+			`{"task_type":"sleep","payload":{"duration_ms":1}}`,
+			`{"task_type":"sleep","payload":{"duration_ms":1}}`,
+		}, wantOK: 2},
+		{name: "conflicting", bodies: []string{
+			`{"task_type":"sleep","payload":{"duration_ms":1}}`,
+			`{"task_type":"sleep","payload":{"duration_ms":2}}`,
+		}, wantOK: 1, wantConflict: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeJobStore{}
+			handler := testHandler(t, store, time.Now().UTC())
+			start := make(chan struct{})
+			statuses := make(chan int, len(tt.bodies))
+			var wait sync.WaitGroup
+			for _, body := range tt.bodies {
+				wait.Add(1)
+				go func(body string) {
+					defer wait.Done()
+					<-start
+					statuses <- performRequestWithIdempotencyKey(handler, body, "concurrent-key").Code
+				}(body)
+			}
+			close(start)
+			wait.Wait()
+			close(statuses)
+			okCount, conflictCount, createdCount := 0, 0, 0
+			for status := range statuses {
+				if status == http.StatusCreated {
+					createdCount++
+					okCount++
+				}
+				if status == http.StatusOK {
+					okCount++
+				}
+				if status == http.StatusConflict {
+					conflictCount++
+				}
+			}
+			if createdCount != 1 || okCount != tt.wantOK || conflictCount != tt.wantConflict || len(store.created) != 1 {
+				t.Errorf("created/ok/conflict/rows = %d/%d/%d/%d", createdCount, okCount, conflictCount, len(store.created))
+			}
+		})
+	}
+}
+
 func TestHandlerRejectsInvalidSubmissions(t *testing.T) {
 	now := time.Date(2026, time.August, 24, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
@@ -165,7 +336,7 @@ func testHandler(t *testing.T, store *fakeJobStore, now time.Time) http.Handler 
 	registry := task.NewRegistry(map[job.TaskType]task.Validator{task.SleepTaskType: task.SleepValidator{}})
 	service, err := app.NewJobService(store, registry, fixedClock{now: now}, fixedIDGenerator{}, func(err error) bool {
 		return store.notFound != nil && errors.Is(err, store.notFound)
-	})
+	}, func(err error) bool { return errors.Is(err, errFakeIdempotencyConflict) })
 	if err != nil {
 		t.Fatalf("NewJobService() error = %v", err)
 	}
@@ -177,6 +348,15 @@ func performRequest(handler http.Handler, method, path, contentType, body string
 	if contentType != "" {
 		request.Header.Set("Content-Type", contentType)
 	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func performRequestWithIdempotencyKey(handler http.Handler, body, key string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", key)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response
@@ -197,6 +377,14 @@ type fakeJobStore struct {
 	loaded      job.Job
 	getError    error
 	notFound    error
+	idempotent  map[string]fakeIdempotentJob
+}
+
+var errFakeIdempotencyConflict = errors.New("idempotency conflict")
+
+type fakeIdempotentJob struct {
+	job         job.Job
+	fingerprint []byte
 }
 
 func (store *fakeJobStore) Create(_ context.Context, value job.Job) error {
@@ -207,6 +395,25 @@ func (store *fakeJobStore) Create(_ context.Context, value job.Job) error {
 	}
 	store.created = append(store.created, value)
 	return nil
+}
+func (store *fakeJobStore) CreateIdempotent(_ context.Context, value job.Job, key string, fingerprint []byte) (job.Job, bool, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.createError != nil {
+		return job.Job{}, false, store.createError
+	}
+	if store.idempotent == nil {
+		store.idempotent = make(map[string]fakeIdempotentJob)
+	}
+	if existing, ok := store.idempotent[key]; ok {
+		if !bytes.Equal(existing.fingerprint, fingerprint) {
+			return job.Job{}, false, errFakeIdempotencyConflict
+		}
+		return existing.job, false, nil
+	}
+	store.created = append(store.created, value)
+	store.idempotent[key] = fakeIdempotentJob{job: value, fingerprint: append([]byte(nil), fingerprint...)}
+	return value, true, nil
 }
 func (store *fakeJobStore) GetByID(context.Context, job.JobID) (job.Job, error) {
 	return store.loaded, store.getError

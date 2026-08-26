@@ -22,9 +22,13 @@ var ErrJobNotFound = errors.New("job not found")
 // ErrInvalidSubmission indicates that submitted fields cannot form a job.
 var ErrInvalidSubmission = errors.New("invalid job submission")
 
+// ErrIdempotencyConflict indicates reuse of a key for another submission.
+var ErrIdempotencyConflict = errors.New("idempotency key conflict")
+
 // JobRepository is the persistence boundary required by job use cases.
 type JobRepository interface {
 	Create(context.Context, job.Job) error
+	CreateIdempotent(context.Context, job.Job, string, []byte) (job.Job, bool, error)
 	GetByID(context.Context, job.JobID) (job.Job, error)
 }
 
@@ -40,33 +44,41 @@ type IDGenerator interface {
 
 // Submission contains caller-controlled job fields.
 type Submission struct {
-	TaskType    job.TaskType
-	Payload     json.RawMessage
-	MaxAttempts *int
-	AvailableAt *time.Time
+	TaskType       job.TaskType
+	Payload        json.RawMessage
+	MaxAttempts    *int
+	AvailableAt    *time.Time
+	IdempotencyKey *string
+}
+
+// SubmissionResult identifies the persisted job and whether it was replayed.
+type SubmissionResult struct {
+	Job      job.Job
+	Replayed bool
 }
 
 // JobService submits and retrieves jobs.
 type JobService struct {
-	repository JobRepository
-	tasks      *task.Registry
-	clock      Clock
-	ids        IDGenerator
-	isNotFound func(error) bool
+	repository            JobRepository
+	tasks                 *task.Registry
+	clock                 Clock
+	ids                   IDGenerator
+	isNotFound            func(error) bool
+	isIdempotencyConflict func(error) bool
 }
 
 // NewJobService constructs the job application service.
-func NewJobService(repository JobRepository, tasks *task.Registry, clock Clock, ids IDGenerator, isNotFound func(error) bool) (*JobService, error) {
-	if repository == nil || tasks == nil || clock == nil || ids == nil || isNotFound == nil {
+func NewJobService(repository JobRepository, tasks *task.Registry, clock Clock, ids IDGenerator, isNotFound, isIdempotencyConflict func(error) bool) (*JobService, error) {
+	if repository == nil || tasks == nil || clock == nil || ids == nil || isNotFound == nil || isIdempotencyConflict == nil {
 		return nil, errors.New("job service dependencies must not be nil")
 	}
-	return &JobService{repository: repository, tasks: tasks, clock: clock, ids: ids, isNotFound: isNotFound}, nil
+	return &JobService{repository: repository, tasks: tasks, clock: clock, ids: ids, isNotFound: isNotFound, isIdempotencyConflict: isIdempotencyConflict}, nil
 }
 
 // Submit validates, constructs, and persists a submitted job.
-func (service *JobService) Submit(ctx context.Context, submission Submission) (job.Job, error) {
+func (service *JobService) Submit(ctx context.Context, submission Submission) (SubmissionResult, error) {
 	if err := service.tasks.Validate(submission.TaskType, submission.Payload); err != nil {
-		return job.Job{}, err
+		return SubmissionResult{}, err
 	}
 	now := service.clock.Now()
 	availableAt := now
@@ -79,16 +91,30 @@ func (service *JobService) Submit(ctx context.Context, submission Submission) (j
 	}
 	id, err := service.ids.NewJobID()
 	if err != nil {
-		return job.Job{}, fmt.Errorf("generate job ID: %w", err)
+		return SubmissionResult{}, fmt.Errorf("generate job ID: %w", err)
 	}
 	created, err := job.New(id, submission.TaskType, submission.Payload, maxAttempts, now, availableAt)
 	if err != nil {
-		return job.Job{}, fmt.Errorf("%w: %v", ErrInvalidSubmission, err)
+		return SubmissionResult{}, fmt.Errorf("%w: %v", ErrInvalidSubmission, err)
 	}
-	if err := service.repository.Create(ctx, created); err != nil {
-		return job.Job{}, fmt.Errorf("persist job: %w", err)
+	if submission.IdempotencyKey == nil {
+		if err := service.repository.Create(ctx, created); err != nil {
+			return SubmissionResult{}, fmt.Errorf("persist job: %w", err)
+		}
+		return SubmissionResult{Job: created}, nil
 	}
-	return created, nil
+	fingerprint, err := fingerprintSubmission(submission)
+	if err != nil {
+		return SubmissionResult{}, fmt.Errorf("%w: fingerprint payload: %v", ErrInvalidSubmission, err)
+	}
+	persisted, wasCreated, err := service.repository.CreateIdempotent(ctx, created, *submission.IdempotencyKey, fingerprint[:])
+	if err != nil {
+		if service.isIdempotencyConflict(err) {
+			return SubmissionResult{}, fmt.Errorf("persist job: %w", ErrIdempotencyConflict)
+		}
+		return SubmissionResult{}, fmt.Errorf("persist job: %w", err)
+	}
+	return SubmissionResult{Job: persisted, Replayed: !wasCreated}, nil
 }
 
 // Get returns a job while translating repository not-found errors.

@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -156,6 +158,149 @@ func TestJobRepositoryIntegration(t *testing.T) {
 			t.Fatalf("truncate jobs: %v", err)
 		}
 	}
+
+	t.Run("idempotent creation and replay", func(t *testing.T) {
+		truncateJobs(t)
+		fingerprint := bytes.Repeat([]byte{0x11}, 32)
+		candidate := integrationJob("idempotent-first", createdAt)
+		created, wasCreated, err := repository.CreateIdempotent(ctx, candidate, "Key-A", fingerprint)
+		if err != nil || !wasCreated || created.ID != candidate.ID {
+			t.Fatalf("first CreateIdempotent() = %#v/%v/%v", created, wasCreated, err)
+		}
+
+		startedAt := createdAt.Add(30 * time.Second).UTC()
+		leaseExpiresAt := createdAt.Add(5 * time.Minute).UTC()
+		if _, err := conn.Exec(ctx, `UPDATE jobs SET state = 'running', attempts_started = 1, started_at = $2, lease_worker_id = 'worker', lease_token = 'token', lease_expires_at = $3 WHERE id = $1`, string(candidate.ID), startedAt, leaseExpiresAt); err != nil {
+			t.Fatal(err)
+		}
+		runningReplay, wasCreated, err := repository.CreateIdempotent(ctx, integrationJob("ignored-running-id", createdAt), "Key-A", fingerprint)
+		if err != nil || wasCreated || runningReplay.State != job.StateRunning || runningReplay.Lease == nil {
+			t.Fatalf("running replay = %#v/%v/%v", runningReplay, wasCreated, err)
+		}
+
+		completedAt := createdAt.Add(time.Minute).UTC()
+		if _, err := conn.Exec(ctx, `UPDATE jobs SET state = 'succeeded', result = '{"ok":true}'::jsonb, completed_at = $2, lease_worker_id = NULL, lease_token = NULL, lease_expires_at = NULL WHERE id = $1`, string(candidate.ID), completedAt); err != nil {
+			t.Fatal(err)
+		}
+		replayed, wasCreated, err := repository.CreateIdempotent(ctx, integrationJob("ignored-new-id", createdAt.Add(time.Hour)), "Key-A", fingerprint)
+		if err != nil || wasCreated {
+			t.Fatalf("replay CreateIdempotent() created/error = %v/%v", wasCreated, err)
+		}
+		if replayed.ID != candidate.ID || replayed.State != job.StateSucceeded || !jsonEqual(replayed.Result, json.RawMessage(`{"ok":true}`)) || replayed.CompletedAt == nil {
+			t.Errorf("replayed current job = %#v", replayed)
+		}
+		var count int
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM jobs").Scan(&count); err != nil || count != 1 {
+			t.Errorf("job count = %d, err %v, want 1", count, err)
+		}
+		_, _, err = repository.CreateIdempotent(ctx, integrationJob("conflict", createdAt), "Key-A", bytes.Repeat([]byte{0x22}, 32))
+		if !errors.Is(err, ErrIdempotencyConflict) {
+			t.Errorf("conflicting CreateIdempotent() error = %v", err)
+		}
+		persisted, err := repository.GetByID(ctx, candidate.ID)
+		if err != nil || persisted.State != job.StateSucceeded || !jsonEqual(persisted.Result, json.RawMessage(`{"ok":true}`)) {
+			t.Errorf("conflict changed existing job = %#v, %v", persisted, err)
+		}
+	})
+
+	t.Run("idempotent insertion rollback", func(t *testing.T) {
+		truncateJobs(t)
+		fingerprint := bytes.Repeat([]byte{0x33}, 32)
+		invalid := integrationJob("invalid-idempotent", createdAt)
+		invalid.State = job.State("invalid")
+		if _, _, err := repository.CreateIdempotent(ctx, invalid, "rollback-key", fingerprint); err == nil {
+			t.Fatal("invalid CreateIdempotent() error = nil")
+		}
+		valid := integrationJob("valid-after-rollback", createdAt)
+		if _, created, err := repository.CreateIdempotent(ctx, valid, "rollback-key", fingerprint); err != nil || !created {
+			t.Fatalf("CreateIdempotent() after rollback = %v/%v", created, err)
+		}
+	})
+
+	t.Run("idempotency migration constraints", func(t *testing.T) {
+		truncateJobs(t)
+		base := integrationJob("constraint-base", createdAt)
+		if err := repository.Create(ctx, base); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(ctx, "UPDATE jobs SET idempotency_key = convert_to('key-only', 'UTF8') WHERE id = $1", string(base.ID)); err == nil {
+			t.Error("key without fingerprint satisfied migration constraints")
+		}
+		if _, err := conn.Exec(ctx, "UPDATE jobs SET idempotency_key = convert_to('short', 'UTF8'), idempotency_fingerprint = decode('aa', 'hex') WHERE id = $1", string(base.ID)); err == nil {
+			t.Error("short fingerprint satisfied migration constraints")
+		}
+	})
+
+	t.Run("concurrent idempotent submissions across repositories", func(t *testing.T) {
+		connectRepository := func(t *testing.T) (*pgx.Conn, *JobRepository) {
+			t.Helper()
+			connection, err := pgx.Connect(ctx, databaseURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := connection.Exec(ctx, "SET search_path TO "+qualifiedSchema); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = connection.Close(ctx) })
+			return connection, NewJobRepository(connection)
+		}
+		_, secondRepository := connectRepository(t)
+		for _, tt := range []struct {
+			name          string
+			fingerprints  [][]byte
+			wantConflicts int
+		}{
+			{name: "identical", fingerprints: [][]byte{bytes.Repeat([]byte{0x44}, 32), bytes.Repeat([]byte{0x44}, 32)}},
+			{name: "conflicting", fingerprints: [][]byte{bytes.Repeat([]byte{0x55}, 32), bytes.Repeat([]byte{0x66}, 32)}, wantConflicts: 1},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				truncateJobs(t)
+				type result struct {
+					job     job.Job
+					created bool
+					err     error
+				}
+				results := make(chan result, 2)
+				start := make(chan struct{})
+				repositories := []*JobRepository{repository, secondRepository}
+				var wait sync.WaitGroup
+				for index := range 2 {
+					wait.Add(1)
+					go func(index int) {
+						defer wait.Done()
+						<-start
+						value, created, err := repositories[index].CreateIdempotent(ctx, integrationJob("concurrent-"+string(rune('a'+index)), createdAt), "shared-key", tt.fingerprints[index])
+						results <- result{job: value, created: created, err: err}
+					}(index)
+				}
+				close(start)
+				wait.Wait()
+				close(results)
+				createdCount, conflictCount := 0, 0
+				var acceptedID job.JobID
+				for result := range results {
+					if result.created {
+						createdCount++
+						acceptedID = result.job.ID
+					}
+					if errors.Is(result.err, ErrIdempotencyConflict) {
+						conflictCount++
+					}
+					if result.err == nil && acceptedID == "" {
+						acceptedID = result.job.ID
+					}
+					if tt.wantConflicts == 0 && result.err == nil && result.job.ID != acceptedID {
+						t.Errorf("identical replay IDs differ")
+					}
+				}
+				var count int
+				_ = conn.QueryRow(ctx, "SELECT count(*) FROM jobs").Scan(&count)
+				if createdCount != 1 || conflictCount != tt.wantConflicts || count != 1 {
+					t.Errorf("created/conflicts/rows = %d/%d/%d", createdCount, conflictCount, count)
+				}
+			})
+		}
+	})
 	claimNow := createdAt.Add(time.Hour)
 	claimExpiresAt := claimNow.Add(5 * time.Minute)
 
@@ -1278,6 +1423,53 @@ func TestJobRepositoryIntegration(t *testing.T) {
 			t.Errorf("concurrent recovered count = %d, want %d", len(seen), jobCount)
 		}
 	})
+}
+
+func TestIdempotencyMigrationDownIntegration(t *testing.T) {
+	databaseURL := os.Getenv(testDatabaseEnvironment)
+	if databaseURL == "" {
+		t.Skip("set MERCURY_TEST_DATABASE_URL to run PostgreSQL integration tests")
+	}
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close(ctx) })
+	schema := "mercury_down_" + time.Now().UTC().Format("20060102_150405_000000000")
+	qualified := pgx.Identifier{schema}.Sanitize()
+	if _, err := conn.Exec(ctx, "CREATE SCHEMA "+qualified); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = conn.Exec(ctx, "DROP SCHEMA "+qualified+" CASCADE") })
+	if _, err := conn.Exec(ctx, "SET search_path TO "+qualified); err != nil {
+		t.Fatal(err)
+	}
+	for _, migrationPath := range upMigrationPaths(t) {
+		migration, err := os.ReadFile(migrationPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(ctx, string(migration)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, filename, _, _ := runtime.Caller(0)
+	downPath := filepath.Join(filepath.Dir(filename), "..", "..", "..", "migrations", "000003_add_job_idempotency.down.sql")
+	down, err := os.ReadFile(downPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, string(down)); err != nil {
+		t.Fatalf("apply down migration: %v", err)
+	}
+	var count int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'jobs' AND column_name IN ('idempotency_key', 'idempotency_fingerprint')`, schema).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Errorf("idempotency columns after down migration = %d", count)
+	}
 }
 
 func integrationJob(id string, createdAt time.Time) job.Job {

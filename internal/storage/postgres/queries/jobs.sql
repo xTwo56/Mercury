@@ -38,9 +38,30 @@ SELECT
     result,
     completed_at,
     last_error,
-    failed_at
+    failed_at,
+    idempotency_key,
+    idempotency_fingerprint
 FROM jobs
 WHERE id = $1;
+
+-- name: CreateIdempotentJob :one
+INSERT INTO jobs (
+    id, task_type, payload, state, max_attempts, attempts_started,
+    created_at, available_at, lease_worker_id, lease_token,
+    lease_expires_at, started_at, result, completed_at, last_error, failed_at,
+    idempotency_key, idempotency_fingerprint
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9,
+    $10, $11, $12, $13, $14, $15, $16, $17, $18
+)
+ON CONFLICT (idempotency_key) DO NOTHING
+RETURNING *;
+
+-- name: GetJobByIdempotencyKeyForUpdate :one
+SELECT *
+FROM jobs
+WHERE idempotency_key = $1
+FOR UPDATE;
 
 -- name: GetNextClaimableJobForUpdate :one
 SELECT
@@ -59,7 +80,9 @@ SELECT
     result,
     completed_at,
     last_error,
-    failed_at
+    failed_at,
+    idempotency_key,
+    idempotency_fingerprint
 FROM jobs
 WHERE state IN ('queued', 'retry_scheduled')
   AND available_at <= sqlc.arg(now)
@@ -110,7 +133,9 @@ SELECT
     result,
     completed_at,
     last_error,
-    failed_at
+    failed_at,
+    idempotency_key,
+    idempotency_fingerprint
 FROM jobs
 WHERE id = sqlc.arg(id)
 FOR UPDATE;
@@ -149,7 +174,9 @@ SELECT
     result,
     completed_at,
     last_error,
-    failed_at
+    failed_at,
+    idempotency_key,
+    idempotency_fingerprint
 FROM jobs
 WHERE state IN ('leased', 'running')
   AND lease_expires_at <= sqlc.arg(now)

@@ -17,11 +17,14 @@ import (
 	"github.com/xtwo56/mercury/internal/task"
 )
 
-const maxRequestBodyBytes int64 = 1 << 20
+const (
+	maxRequestBodyBytes    int64 = 1 << 20
+	maxIdempotencyKeyBytes       = 255
+)
 
 // JobService is the application boundary used by HTTP handlers.
 type JobService interface {
-	Submit(context.Context, app.Submission) (job.Job, error)
+	Submit(context.Context, app.Submission) (app.SubmissionResult, error)
 	Get(context.Context, job.JobID) (job.Job, error)
 }
 
@@ -91,6 +94,11 @@ func (handler *Handler) submit(response http.ResponseWriter, request *http.Reque
 		writeError(response, http.StatusBadRequest, "invalid_json", "request body must contain one JSON object")
 		return
 	}
+	idempotencyKey, err := requestIdempotencyKey(request)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key is invalid")
+		return
+	}
 
 	var availableAt *time.Time
 	if submitted.AvailableAt != nil {
@@ -102,10 +110,11 @@ func (handler *Handler) submit(response http.ResponseWriter, request *http.Reque
 		availableAt = &parsed
 	}
 	created, err := handler.jobs.Submit(request.Context(), app.Submission{
-		TaskType:    job.TaskType(submitted.TaskType),
-		Payload:     submitted.Payload,
-		MaxAttempts: submitted.MaxAttempts,
-		AvailableAt: availableAt,
+		TaskType:       job.TaskType(submitted.TaskType),
+		Payload:        submitted.Payload,
+		MaxAttempts:    submitted.MaxAttempts,
+		AvailableAt:    availableAt,
+		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
 		switch {
@@ -115,14 +124,37 @@ func (handler *Handler) submit(response http.ResponseWriter, request *http.Reque
 			writeError(response, http.StatusBadRequest, "invalid_payload", "payload does not match the task definition")
 		case errors.Is(err, app.ErrInvalidSubmission):
 			writeError(response, http.StatusBadRequest, "invalid_job", "job submission is invalid")
+		case errors.Is(err, app.ErrIdempotencyConflict):
+			writeError(response, http.StatusConflict, "idempotency_conflict", "Idempotency-Key was already used for another submission")
 		default:
 			writeError(response, http.StatusInternalServerError, "internal_error", "internal server error")
 		}
 		return
 	}
 
-	response.Header().Set("Location", "/v1/jobs/"+url.PathEscape(string(created.ID)))
-	writeJSON(response, http.StatusCreated, publicJob(created))
+	response.Header().Set("Location", "/v1/jobs/"+url.PathEscape(string(created.Job.ID)))
+	status := http.StatusCreated
+	if created.Replayed {
+		status = http.StatusOK
+	}
+	writeJSON(response, status, publicJob(created.Job))
+}
+
+func requestIdempotencyKey(request *http.Request) (*string, error) {
+	values := request.Header.Values("Idempotency-Key")
+	if len(values) == 0 {
+		return nil, nil
+	}
+	if len(values) != 1 || len(values[0]) == 0 || len(values[0]) > maxIdempotencyKeyBytes {
+		return nil, errors.New("invalid Idempotency-Key")
+	}
+	for _, character := range []byte(values[0]) {
+		if character < 0x21 || character > 0x7e {
+			return nil, errors.New("invalid Idempotency-Key")
+		}
+	}
+	key := values[0]
+	return &key, nil
 }
 
 func (handler *Handler) get(response http.ResponseWriter, request *http.Request, id job.JobID) {

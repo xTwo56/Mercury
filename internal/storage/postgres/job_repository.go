@@ -3,6 +3,7 @@ package postgres
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,9 @@ var ErrJobNotFound = errors.New("job not found")
 
 // ErrNoJobAvailable indicates that no job is currently eligible to be claimed.
 var ErrNoJobAvailable = errors.New("no job available")
+
+// ErrIdempotencyConflict indicates that a key belongs to another submission.
+var ErrIdempotencyConflict = errors.New("idempotency key conflict")
 
 // MaxRecoveryBatchSize is the largest batch accepted by expired-lease recovery.
 const MaxRecoveryBatchSize = 1000
@@ -74,6 +78,58 @@ func (r *JobRepository) Create(ctx context.Context, j job.Job) error {
 		return fmt.Errorf("create job %q: %w", j.ID, err)
 	}
 	return nil
+}
+
+// CreateIdempotent atomically creates a job or replays the job bound to key.
+func (r *JobRepository) CreateIdempotent(ctx context.Context, j job.Job, key string, fingerprint []byte) (job.Job, bool, error) {
+	if key == "" {
+		return job.Job{}, false, errors.New("create idempotent job: key must not be empty")
+	}
+	if len(fingerprint) != 32 {
+		return job.Job{}, false, errors.New("create idempotent job: fingerprint must be 32 bytes")
+	}
+	maxAttempts, err := postgresInteger(j.MaxAttempts)
+	if err != nil {
+		return job.Job{}, false, fmt.Errorf("create idempotent job %q: max attempts: %w", j.ID, err)
+	}
+	attemptsStarted, err := postgresInteger(j.AttemptsStarted)
+	if err != nil {
+		return job.Job{}, false, fmt.Errorf("create idempotent job %q: attempts started: %w", j.ID, err)
+	}
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return job.Job{}, false, fmt.Errorf("create idempotent job %q: begin transaction: %w", j.ID, err)
+	}
+	queries := r.queries.WithTx(tx)
+	leaseWorkerID, leaseToken, leaseExpiresAt := nullableLease(j.Lease)
+	inserted, err := queries.CreateIdempotentJob(ctx, generated.CreateIdempotentJobParams{
+		ID: string(j.ID), TaskType: string(j.TaskType), Payload: append([]byte(nil), j.Payload...),
+		State: string(j.State), MaxAttempts: maxAttempts, AttemptsStarted: attemptsStarted,
+		CreatedAt: timestamptz(j.CreatedAt), AvailableAt: timestamptz(j.AvailableAt),
+		LeaseWorkerID: leaseWorkerID, LeaseToken: leaseToken, LeaseExpiresAt: leaseExpiresAt,
+		StartedAt: nullableTimestamptz(j.StartedAt), Result: nullableJSON(j.Result),
+		CompletedAt: nullableTimestamptz(j.CompletedAt), LastError: nullableString(j.LastError),
+		FailedAt: nullableTimestamptz(j.FailedAt), IdempotencyKey: []byte(key),
+		IdempotencyFingerprint: append([]byte(nil), fingerprint...),
+	})
+	created := err == nil
+	if errors.Is(err, pgx.ErrNoRows) {
+		inserted, err = queries.GetJobByIdempotencyKeyForUpdate(ctx, []byte(key))
+	}
+	if err != nil {
+		return job.Job{}, false, rollbackTransaction(ctx, tx, fmt.Errorf("create idempotent job %q: persist or load replay: %w", j.ID, err))
+	}
+	if !created && subtle.ConstantTimeCompare(inserted.IdempotencyFingerprint, fingerprint) != 1 {
+		return job.Job{}, false, rollbackTransaction(ctx, tx, fmt.Errorf("create idempotent job: %w", ErrIdempotencyConflict))
+	}
+	result, err := jobFromRow(inserted)
+	if err != nil {
+		return job.Job{}, false, rollbackTransaction(ctx, tx, fmt.Errorf("create idempotent job %q: decode: %w", j.ID, err))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return job.Job{}, false, rollbackTransaction(ctx, tx, fmt.Errorf("create idempotent job %q: commit transaction: %w", j.ID, err))
+	}
+	return result, created, nil
 }
 
 // GetByID returns the complete persisted representation of a job.

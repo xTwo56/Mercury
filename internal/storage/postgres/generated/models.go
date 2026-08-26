@@ -9,20 +9,22 @@ import (
 )
 
 type Job struct {
-	ID              string
-	TaskType        string
-	Payload         []byte
-	State           string
-	MaxAttempts     int32
-	AttemptsStarted int32
-	CreatedAt       pgtype.Timestamptz
-	AvailableAt     pgtype.Timestamptz
-	LeaseWorkerID   *string
-	LeaseToken      *string
-	LeaseExpiresAt  pgtype.Timestamptz
-	StartedAt       pgtype.Timestamptz
-	Result          []byte
-	CompletedAt     pgtype.Timestamptz
-	LastError       *string
-	FailedAt        pgtype.Timestamptz
+	ID                     string
+	TaskType               string
+	Payload                []byte
+	State                  string
+	MaxAttempts            int32
+	AttemptsStarted        int32
+	CreatedAt              pgtype.Timestamptz
+	AvailableAt            pgtype.Timestamptz
+	LeaseWorkerID          *string
+	LeaseToken             *string
+	LeaseExpiresAt         pgtype.Timestamptz
+	StartedAt              pgtype.Timestamptz
+	Result                 []byte
+	CompletedAt            pgtype.Timestamptz
+	LastError              *string
+	FailedAt               pgtype.Timestamptz
+	IdempotencyKey         []byte
+	IdempotencyFingerprint []byte
 }
