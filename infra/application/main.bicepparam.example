@@ -1,0 +1,17 @@
+using './main.bicep'
+
+param location = 'centralindia'
+param registryName = 'replacewithgloballyuniqueacr'
+param containerAppsEnvironmentName = 'mercury-dev-env'
+param mercuryImageTag = 'v0.1.0'
+param migrationImageTag = 'v0.1.0'
+param databaseUrl = readEnvironmentVariable('MERCURY_AZURE_DATABASE_URL')
+param apiAppName = 'mercury-api'
+param workerAppName = 'mercury-worker'
+param schedulerAppName = 'mercury-scheduler'
+param migrationJobName = 'mercury-migrate'
+param runtimeIdentityName = 'mercury-runtime'
+param apiMinReplicas = 1
+param apiMaxReplicas = 3
+param workerReplicaCount = 1
+param schedulerReplicaCount = 1

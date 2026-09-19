@@ -6,19 +6,22 @@ import (
 )
 
 var (
-	// ErrJobNotRunning identifies lease renewal rejected outside the running state.
+	// ErrJobNotRunning identifies renewal rejected outside the running state.
 	ErrJobNotRunning = errors.New("job is not running")
-	// ErrLeaseMissing identifies an operation rejected because no current lease exists.
+	// ErrLeaseMissing identifies renewal rejected because no current lease exists.
 	ErrLeaseMissing = errors.New("job has no lease")
-	// ErrLeaseWorkerMismatch identifies a lease owned by another worker.
+	// ErrLeaseWorkerMismatch identifies renewal attempted by a different worker.
 	ErrLeaseWorkerMismatch = errors.New("lease worker does not match")
-	// ErrLeaseTokenMismatch identifies invalid lease credentials.
+	// ErrLeaseTokenMismatch identifies renewal attempted with a stale or invalid token.
 	ErrLeaseTokenMismatch = errors.New("lease token does not match")
-	// ErrLeaseExpired identifies a lease that is no longer valid at the supplied time.
+	// ErrLeaseExpired identifies renewal at or after the confirmed expiration.
 	ErrLeaseExpired = errors.New("lease has expired")
 )
 
-// RenewLease extends the current lease held by a running job.
+// RenewLease authenticates a running worker and moves its lease expiration
+// strictly forward. Requiring the proposed expiration to exceed both now and
+// the confirmed expiration prevents delayed or concurrent heartbeats from
+// shortening the lease. Only ExpiresAt changes after successful validation.
 func (j *Job) RenewLease(workerID WorkerID, token LeaseToken, now, newExpiresAt time.Time) error {
 	if now.IsZero() {
 		return errors.New("current time must not be zero")

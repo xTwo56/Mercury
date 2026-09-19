@@ -18,7 +18,7 @@ import (
 
 // Repository is the persistent lifecycle boundary required by workers.
 type Repository interface {
-	ClaimNext(context.Context, job.WorkerID, job.LeaseToken, time.Time, time.Time) (job.Job, error)
+	ClaimNext(context.Context, job.WorkerID, job.LeaseToken, time.Time, time.Time, ...job.TaskType) (job.Job, error)
 	StartExecution(context.Context, job.JobID, job.WorkerID, job.LeaseToken, time.Time) (job.Job, error)
 	CompleteExecution(context.Context, job.JobID, job.WorkerID, job.LeaseToken, json.RawMessage, time.Time) (job.Job, error)
 	FailExecution(context.Context, job.JobID, job.WorkerID, job.LeaseToken, time.Time, string, *time.Time) (job.Job, error)
@@ -127,7 +127,7 @@ func (coordinator *Coordinator) claimOne(ctx context.Context) bool {
 		return false
 	}
 	now := coordinator.clock.Now()
-	claimed, err := coordinator.repository.ClaimNext(ctx, coordinator.config.WorkerID, token, now, now.Add(coordinator.config.LeaseDuration))
+	claimed, err := coordinator.repository.ClaimNext(ctx, coordinator.config.WorkerID, token, now, now.Add(coordinator.config.LeaseDuration), coordinator.handlers.SupportedTypes()...)
 	if err != nil {
 		release()
 		if !coordinator.isNoJob(err) && ctx.Err() == nil {

@@ -452,13 +452,20 @@ FROM jobs
 WHERE state IN ('queued', 'retry_scheduled')
   AND available_at <= $1
   AND attempts_started < max_attempts
+  -- Filter while holding the candidate lock; unsupported work stays available.
+  AND task_type = ANY($2::text[])
 ORDER BY available_at, created_at, id
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 `
 
-func (q *Queries) GetNextClaimableJobForUpdate(ctx context.Context, now pgtype.Timestamptz) (Job, error) {
-	row := q.db.QueryRow(ctx, getNextClaimableJobForUpdate, now)
+type GetNextClaimableJobForUpdateParams struct {
+	Now            pgtype.Timestamptz
+	SupportedTypes []string
+}
+
+func (q *Queries) GetNextClaimableJobForUpdate(ctx context.Context, arg GetNextClaimableJobForUpdateParams) (Job, error) {
+	row := q.db.QueryRow(ctx, getNextClaimableJobForUpdate, arg.Now, arg.SupportedTypes)
 	var i Job
 	err := row.Scan(
 		&i.ID,

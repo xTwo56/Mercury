@@ -2,19 +2,27 @@ package job
 
 import "fmt"
 
-// State represents the current state of a job.
+// State identifies a durable stage in the job execution lifecycle.
 type State string
 
 const (
-	StateQueued         State = "queued" // available to claom rn
-	StateLeased         State = "leased"
-	StateRunning        State = "running"
-	StateRetryScheduled State = "retry_scheduled" // will be available to claim after a scheduled time
-	StateSucceeded      State = "succeeded"
-	StateFailed         State = "failed"
+	// StateQueued is eligible for claiming once AvailableAt is reached.
+	StateQueued State = "queued"
+	// StateLeased is temporarily owned by a worker but has not started execution.
+	StateLeased State = "leased"
+	// StateRunning has started an attempt under an active worker lease.
+	StateRunning State = "running"
+	// StateRetryScheduled becomes eligible for another claim at AvailableAt.
+	StateRetryScheduled State = "retry_scheduled"
+	// StateSucceeded is terminal and contains a successful result.
+	StateSucceeded State = "succeeded"
+	// StateFailed is terminal because the execution attempt budget is exhausted.
+	StateFailed State = "failed"
 )
 
-// ParseState converts value to a State, rejecting unknown states.
+// ParseState converts a persisted or external string to a supported State.
+// Rejecting unknown values prevents invalid storage data from entering the
+// domain aggregate.
 func ParseState(value string) (State, error) {
 	switch State(value) {
 	case StateQueued, StateLeased, StateRunning, StateRetryScheduled, StateSucceeded, StateFailed:
@@ -24,7 +32,9 @@ func ParseState(value string) (State, error) {
 	}
 }
 
-// CanTransition reports whether a job may move directly from one state to another.
+// CanTransition reports whether the lifecycle permits a direct state change.
+// It includes worker-driven execution paths and system-driven lease recovery;
+// terminal states intentionally have no outgoing transitions.
 func CanTransition(from, to State) bool {
 	return from == StateQueued && to == StateLeased ||
 		from == StateRetryScheduled && to == StateLeased ||

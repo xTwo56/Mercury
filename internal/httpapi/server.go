@@ -10,7 +10,9 @@ import (
 	"time"
 )
 
-// ServerConfig controls the external HTTP server.
+// ServerConfig defines the listener and resource bounds for the external HTTP
+// server. Positive timeouts prevent slow or abandoned connections from holding
+// server resources indefinitely and bound graceful shutdown.
 type ServerConfig struct {
 	ListenAddress     string
 	ReadTimeout       time.Duration
@@ -20,7 +22,8 @@ type ServerConfig struct {
 	ShutdownTimeout   time.Duration
 }
 
-// Server runs the external HTTP API with graceful shutdown.
+// Server owns the net/http listener and graceful-shutdown lifecycle for the
+// external API. Request behavior remains entirely in the injected Handler.
 type Server struct {
 	server          *http.Server
 	shutdownTimeout time.Duration
@@ -28,7 +31,8 @@ type Server struct {
 	logger          *slog.Logger
 }
 
-// NewServer validates configuration and constructs the HTTP server.
+// NewServer validates all listener timeouts and constructs a stopped Server.
+// A nil logger falls back to slog.Default; no listener is opened until Run.
 func NewServer(config ServerConfig, handler http.Handler, logger *slog.Logger) (*Server, error) {
 	if config.ListenAddress == "" {
 		return nil, errors.New("HTTP listen address must not be empty")
@@ -51,13 +55,19 @@ func NewServer(config ServerConfig, handler http.Handler, logger *slog.Logger) (
 	}, nil
 }
 
-// Run serves requests until cancellation and then drains active requests.
+// Run opens the configured listener and serves until the server fails or ctx is
+// cancelled. Cancellation starts a separately timed shutdown context so the
+// cancelled application context does not prevent in-flight requests from
+// draining. After a successful Shutdown, Run joins the serving goroutine before
+// returning and verifies that it stopped for the expected reason.
 func (server *Server) Run(ctx context.Context) error {
 	listener, err := server.listen("tcp", server.server.Addr)
 	if err != nil {
 		return fmt.Errorf("listen for HTTP requests: %w", err)
 	}
 	server.logger.InfoContext(ctx, "Mercury HTTP API started", "address", server.server.Addr)
+	// The buffered result lets Serve report its terminal error even if listener
+	// shutdown completes while Run is moving between select branches.
 	served := make(chan error, 1)
 	go func() { served <- server.server.Serve(listener) }()
 

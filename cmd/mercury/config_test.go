@@ -183,5 +183,25 @@ func TestConfigValidationIsRoleSpecific(t *testing.T) {
 }
 
 func environment(values map[string]string) func(string) string {
+	if _, ok := values[workerBearerEnvironment]; !ok {
+		values[workerBearerEnvironment] = "test-worker-credential"
+	}
 	return func(name string) string { return values[name] }
+}
+
+func TestWorkerBearerConfiguration(t *testing.T) {
+	for _, value := range []string{"", " ", "has space", "has\nnewline"} {
+		_, err := loadConfig(environment(map[string]string{databaseURLEnvironment: "postgres://database/db", workerBearerEnvironment: value}))
+		if err == nil {
+			t.Fatal("invalid worker bearer credential accepted")
+		}
+		if value != "" && value != " " && strings.Contains(err.Error(), value) {
+			t.Fatal("credential exposed in error")
+		}
+	}
+	for _, role := range []runtimeRole{roleWorker, roleScheduler} {
+		if _, err := loadConfig(environment(map[string]string{databaseURLEnvironment: "postgres://database/db", roleEnvironment: string(role), workerBearerEnvironment: ""})); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

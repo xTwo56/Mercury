@@ -6,10 +6,30 @@ import (
 	"time"
 )
 
-// Start transitions a leased job to running for the worker holding its lease.
+// Start authenticates the current lease holder and transitions a leased Job to
+// running. It records the supplied time in UTC and consumes exactly one attempt
+// only after every validation succeeds, so retries and rejected starts cannot
+// accidentally inflate AttemptsStarted.
 func (j *Job) Start(workerID WorkerID, token LeaseToken, now time.Time) error {
 	if now.IsZero() {
 		return errors.New("current time must not be zero")
+	}
+	// An uncertain start response may be retried with the same live lease.
+	// Validate ownership again without consuming another attempt or moving time.
+	if j.State == StateRunning {
+		if j.Lease == nil {
+			return ErrLeaseMissing
+		}
+		if j.Lease.WorkerID != workerID {
+			return ErrLeaseWorkerMismatch
+		}
+		if j.Lease.Token != token {
+			return ErrLeaseTokenMismatch
+		}
+		if !now.Before(j.Lease.ExpiresAt) {
+			return ErrLeaseExpired
+		}
+		return nil
 	}
 	if !CanTransition(j.State, StateRunning) {
 		return errors.New("job cannot transition to running")
@@ -28,7 +48,10 @@ func (j *Job) Start(workerID WorkerID, token LeaseToken, now time.Time) error {
 	return nil
 }
 
-// Complete records the successful result of a running job.
+// Complete authenticates an unexpired running lease and records successful
+// terminal output. It defensively copies valid JSON (including JSON null),
+// records the UTC completion time, transitions to succeeded, and clears the
+// lease so stale workers cannot submit another terminal outcome.
 func (j *Job) Complete(workerID WorkerID, token LeaseToken, now time.Time, result json.RawMessage) error {
 	if now.IsZero() {
 		return errors.New("completion time must not be zero")
@@ -60,8 +83,22 @@ func (j *Job) Complete(workerID WorkerID, token LeaseToken, now time.Time, resul
 	return nil
 }
 
-// Fail records an execution failure and either schedules a retry or ends the job.
+// Fail authenticates an unexpired running lease and records the latest task
+// failure. When another attempt remains, retryAt must be strictly later than
+// now and becomes the next claim boundary; otherwise the Job becomes terminally
+// failed. Either successful path clears its lease and per-execution StartedAt,
+// while validation errors leave all fields unchanged.
 func (j *Job) Fail(workerID WorkerID, token LeaseToken, now time.Time, message string, retryAt *time.Time) error {
+	return j.fail(workerID, token, now, message, retryAt, false)
+}
+
+// FailPermanent ends this job even when attempts remain. It uses the same
+// ownership checks and accounting as retryable failure; it never invents attempts.
+func (j *Job) FailPermanent(workerID WorkerID, token LeaseToken, now time.Time, message string) error {
+	return j.fail(workerID, token, now, message, nil, true)
+}
+
+func (j *Job) fail(workerID WorkerID, token LeaseToken, now time.Time, message string, retryAt *time.Time, permanent bool) error {
 	if now.IsZero() {
 		return errors.New("failure time must not be zero")
 	}
@@ -84,7 +121,7 @@ func (j *Job) Fail(workerID WorkerID, token LeaseToken, now time.Time, message s
 		return errors.New("failure message must not be empty")
 	}
 
-	retryable := j.AttemptsStarted < j.MaxAttempts
+	retryable := !permanent && j.AttemptsStarted < j.MaxAttempts
 	if retryable {
 		if retryAt == nil || retryAt.IsZero() {
 			return errors.New("retry time must not be zero")

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"sync"
 
 	"github.com/xtwo56/mercury/internal/job"
@@ -85,4 +86,18 @@ func isNilHandler(handler Handler) bool {
 	default:
 		return false
 	}
+}
+
+// SupportedTypes freezes routing and returns a sorted snapshot for claiming.
+// Filtering at storage means this worker never leases work it cannot execute.
+func (registry *HandlerRegistry) SupportedTypes() []job.TaskType {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	registry.sealed = true
+	types := make([]job.TaskType, 0, len(registry.handlers))
+	for taskType := range registry.handlers {
+		types = append(types, taskType)
+	}
+	sort.Slice(types, func(i, j int) bool { return types[i] < types[j] })
+	return types
 }

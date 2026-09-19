@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -25,6 +26,10 @@ var ErrNoJobAvailable = errors.New("no job available")
 // ErrIdempotencyConflict indicates that a key belongs to another submission.
 var ErrIdempotencyConflict = errors.New("idempotency key conflict")
 
+// ErrLifecycleConflict means the requested transition no longer owns a live execution.
+// Callers must reconcile state rather than treating it as a transient database error.
+var ErrLifecycleConflict = errors.New("lifecycle ownership or state conflict")
+
 // MaxRecoveryBatchSize is the largest batch accepted by expired-lease recovery.
 const MaxRecoveryBatchSize = 1000
 
@@ -35,13 +40,31 @@ type transactionalDB interface {
 
 // JobRepository stores and retrieves jobs from PostgreSQL.
 type JobRepository struct {
-	db      transactionalDB
-	queries *generated.Queries
+	db             transactionalDB
+	queries        *generated.Queries
+	lifecycleClock func() time.Time
 }
 
 // NewJobRepository creates a job repository backed by db.
 func NewJobRepository(db transactionalDB) *JobRepository {
 	return &JobRepository{db: db, queries: generated.New(db)}
+}
+
+// WithLifecycleClock returns a repository view that checks time after acquiring
+// lifecycle row locks. HTTP requests may wait for another transaction; their
+// arrival time must not authorize a report after its lease has actually expired.
+// A nil clock retains the explicit timestamps used by deterministic callers.
+func (r *JobRepository) WithLifecycleClock(clock func() time.Time) *JobRepository {
+	copy := *r
+	copy.lifecycleClock = clock
+	return &copy
+}
+
+func (r *JobRepository) lifecycleTime(supplied time.Time) time.Time {
+	if r.lifecycleClock != nil {
+		return r.lifecycleClock()
+	}
+	return supplied
 }
 
 // Create inserts a job in its current domain state.
@@ -150,14 +173,25 @@ func (r *JobRepository) GetByID(ctx context.Context, id job.JobID) (job.Job, err
 }
 
 // ClaimNext atomically leases the earliest currently eligible job.
-func (r *JobRepository) ClaimNext(ctx context.Context, workerID job.WorkerID, token job.LeaseToken, now, expiresAt time.Time) (job.Job, error) {
+func (r *JobRepository) ClaimNext(ctx context.Context, workerID job.WorkerID, token job.LeaseToken, now, expiresAt time.Time, supportedTypes ...job.TaskType) (job.Job, error) {
+	// Empty never means all types. Validate before opening a transaction.
+	if len(supportedTypes) == 0 {
+		return job.Job{}, errors.New("supported task types must not be empty")
+	}
+	types := make([]string, len(supportedTypes))
+	for i, taskType := range supportedTypes {
+		if strings.TrimSpace(string(taskType)) == "" {
+			return job.Job{}, errors.New("supported task type must not be blank")
+		}
+		types[i] = string(taskType)
+	}
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return job.Job{}, fmt.Errorf("claim next job: begin transaction: %w", err)
 	}
 
 	queries := r.queries.WithTx(tx)
-	row, err := queries.GetNextClaimableJobForUpdate(ctx, timestamptz(now))
+	row, err := queries.GetNextClaimableJobForUpdate(ctx, generated.GetNextClaimableJobForUpdateParams{Now: timestamptz(now), SupportedTypes: types})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("claim next job: %w", ErrNoJobAvailable))
 	}
@@ -168,6 +202,11 @@ func (r *JobRepository) ClaimNext(ctx context.Context, workerID job.WorkerID, to
 	claimed, err := jobFromRow(row)
 	if err != nil {
 		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("claim next job: decode candidate: %w", err))
+	}
+	if r.lifecycleClock != nil {
+		duration := expiresAt.Sub(now)
+		now = r.lifecycleTime(now)
+		expiresAt = now.Add(duration)
 	}
 	if err := claimed.Claim(workerID, token, now, expiresAt); err != nil {
 		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("claim next job %q: validate claim: %w", claimed.ID, err))
@@ -213,8 +252,9 @@ func (r *JobRepository) StartExecution(ctx context.Context, jobID job.JobID, wor
 	if err != nil {
 		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("start job %q: decode: %w", jobID, err))
 	}
+	now = r.lifecycleTime(now)
 	if err := started.Start(workerID, token, now); err != nil {
-		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("start job %q: validate: %w", jobID, err))
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("start job %q: validate: %w: %w", jobID, ErrLifecycleConflict, err))
 	}
 	attemptsStarted, err := postgresInteger(started.AttemptsStarted)
 	if err != nil {
@@ -241,6 +281,19 @@ func (r *JobRepository) StartExecution(ctx context.Context, jobID job.JobID, wor
 
 // RenewLease atomically authenticates and extends a running job's lease.
 func (r *JobRepository) RenewLease(ctx context.Context, jobID job.JobID, workerID job.WorkerID, token job.LeaseToken, now, newExpiresAt time.Time) (job.Job, error) {
+	return r.renewLease(ctx, jobID, workerID, token, now, newExpiresAt, 0)
+}
+
+// RenewLeaseBounded limits remote execution even if a worker keeps heartbeating.
+// The deadline is derived from the durable first start while its row is locked.
+func (r *JobRepository) RenewLeaseBounded(ctx context.Context, jobID job.JobID, workerID job.WorkerID, token job.LeaseToken, now, newExpiresAt time.Time, maxExecution time.Duration) (job.Job, error) {
+	if maxExecution <= 0 {
+		return job.Job{}, errors.New("execution bound must be positive")
+	}
+	return r.renewLease(ctx, jobID, workerID, token, now, newExpiresAt, maxExecution)
+}
+
+func (r *JobRepository) renewLease(ctx context.Context, jobID job.JobID, workerID job.WorkerID, token job.LeaseToken, now, newExpiresAt time.Time, maxExecution time.Duration) (job.Job, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return job.Job{}, fmt.Errorf("renew job %q lease: begin transaction: %w", jobID, err)
@@ -259,8 +312,19 @@ func (r *JobRepository) RenewLease(ctx context.Context, jobID job.JobID, workerI
 	if err != nil {
 		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("renew job %q lease: decode: %w", jobID, err))
 	}
+	if r.lifecycleClock != nil {
+		duration := newExpiresAt.Sub(now)
+		now = r.lifecycleTime(now)
+		newExpiresAt = now.Add(duration)
+	}
+	if maxExecution > 0 && renewed.StartedAt != nil {
+		deadline := renewed.StartedAt.Add(maxExecution)
+		if newExpiresAt.After(deadline) {
+			newExpiresAt = deadline
+		}
+	}
 	if err := renewed.RenewLease(workerID, token, now, newExpiresAt); err != nil {
-		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("renew job %q lease: validate: %w", jobID, err))
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("renew job %q lease: validate: %w: %w", jobID, ErrLifecycleConflict, err))
 	}
 
 	rowsAffected, err := queries.RenewJobLease(ctx, generated.RenewJobLeaseParams{
@@ -299,8 +363,9 @@ func (r *JobRepository) CompleteExecution(ctx context.Context, jobID job.JobID, 
 	if err != nil {
 		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("complete job %q: decode: %w", jobID, err))
 	}
+	now = r.lifecycleTime(now)
 	if err := completed.Complete(workerID, token, now, result); err != nil {
-		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("complete job %q: validate: %w", jobID, err))
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("complete job %q: validate: %w: %w", jobID, ErrLifecycleConflict, err))
 	}
 
 	rowsAffected, err := queries.CompleteJob(ctx, generated.CompleteJobParams{
@@ -323,6 +388,16 @@ func (r *JobRepository) CompleteExecution(ctx context.Context, jobID job.JobID, 
 
 // FailExecution atomically authenticates and records a running job's failure.
 func (r *JobRepository) FailExecution(ctx context.Context, jobID job.JobID, workerID job.WorkerID, token job.LeaseToken, now time.Time, message string, retryAt *time.Time) (job.Job, error) {
+	return r.failExecution(ctx, jobID, workerID, token, now, message, retryAt, false)
+}
+
+// FailExecutionPermanently records a non-retryable outcome in the existing
+// row-locked lifecycle transaction, preserving fencing and actual attempt counts.
+func (r *JobRepository) FailExecutionPermanently(ctx context.Context, jobID job.JobID, workerID job.WorkerID, token job.LeaseToken, now time.Time, message string) (job.Job, error) {
+	return r.failExecution(ctx, jobID, workerID, token, now, message, nil, true)
+}
+
+func (r *JobRepository) failExecution(ctx context.Context, jobID job.JobID, workerID job.WorkerID, token job.LeaseToken, now time.Time, message string, retryAt *time.Time, permanent bool) (job.Job, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return job.Job{}, fmt.Errorf("fail job %q: begin transaction: %w", jobID, err)
@@ -341,8 +416,21 @@ func (r *JobRepository) FailExecution(ctx context.Context, jobID job.JobID, work
 	if err != nil {
 		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("fail job %q: decode: %w", jobID, err))
 	}
-	if err := failed.Fail(workerID, token, now, message, retryAt); err != nil {
-		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("fail job %q: validate: %w", jobID, err))
+	if r.lifecycleClock != nil && retryAt != nil {
+		delay := retryAt.Sub(now)
+		now = r.lifecycleTime(now)
+		adjusted := now.Add(delay)
+		retryAt = &adjusted
+	} else {
+		now = r.lifecycleTime(now)
+	}
+	if permanent {
+		err = failed.FailPermanent(workerID, token, now, message)
+	} else {
+		err = failed.Fail(workerID, token, now, message, retryAt)
+	}
+	if err != nil {
+		return job.Job{}, rollbackTransaction(ctx, tx, fmt.Errorf("fail job %q: validate: %w: %w", jobID, ErrLifecycleConflict, err))
 	}
 
 	rowsAffected, err := queries.FailJob(ctx, generated.FailJobParams{

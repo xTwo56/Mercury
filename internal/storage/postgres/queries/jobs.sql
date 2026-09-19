@@ -87,6 +87,8 @@ FROM jobs
 WHERE state IN ('queued', 'retry_scheduled')
   AND available_at <= sqlc.arg(now)
   AND attempts_started < max_attempts
+  -- Filter while holding the candidate lock; unsupported work stays available.
+  AND task_type = ANY(sqlc.arg(supported_types)::text[])
 ORDER BY available_at, created_at, id
 LIMIT 1
 FOR UPDATE SKIP LOCKED;

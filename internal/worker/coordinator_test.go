@@ -39,6 +39,9 @@ func TestCoordinatorSuccessfulExecution(t *testing.T) {
 	if repository.startCalls != 1 || repository.completeCalls != 1 || repository.failCalls != 0 {
 		t.Errorf("lifecycle calls start/complete/fail = %d/%d/%d", repository.startCalls, repository.completeCalls, repository.failCalls)
 	}
+	if len(repository.claimTypes) != 1 || len(repository.claimTypes[0]) != 1 || repository.claimTypes[0][0] != task.SleepTaskType {
+		t.Fatal("built-in worker did not restrict claims to registered types")
+	}
 	if len(repository.claimTokens) != 1 || repository.claimTokens[0] == "" {
 		t.Error("claim did not use a lease token")
 	}
@@ -316,6 +319,7 @@ type fakeRepository struct {
 	jobs                                 []job.Job
 	claimed                              map[job.JobID]job.Job
 	claimTokens                          []job.LeaseToken
+	claimTypes                           [][]job.TaskType
 	startError, completeError, failError error
 	startCalls, completeCalls, failCalls int
 	completed                            chan struct{}
@@ -328,10 +332,11 @@ type fakeRepository struct {
 	completeContextErr                   error
 }
 
-func (r *fakeRepository) ClaimNext(_ context.Context, _ job.WorkerID, token job.LeaseToken, _, _ time.Time) (job.Job, error) {
+func (r *fakeRepository) ClaimNext(_ context.Context, _ job.WorkerID, token job.LeaseToken, _, _ time.Time, supportedTypes ...job.TaskType) (job.Job, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.claimTokens = append(r.claimTokens, token)
+	r.claimTypes = append(r.claimTypes, append([]job.TaskType(nil), supportedTypes...))
 	if len(r.jobs) == 0 {
 		return job.Job{}, errNoJob
 	}

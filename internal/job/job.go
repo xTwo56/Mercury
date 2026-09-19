@@ -1,3 +1,8 @@
+// Package job defines Mercury's submitted-work aggregate and its lifecycle
+// rules. A Job is created queued, temporarily owned through a Lease, and then
+// advanced by authenticated execution operations. The package has no clock,
+// token generator, persistence, or synchronization of its own: callers supply
+// time and credentials and must serialize mutations to a shared job.
 package job
 
 import (
@@ -7,11 +12,16 @@ import (
 )
 
 type (
-	JobID    string
+	// JobID uniquely identifies a submitted job across Mercury.
+	JobID string
+	// TaskType selects the registered task contract and execution handler.
 	TaskType string
 )
 
-// submitted unit of work.
+// Job is a submitted unit of work together with its current lifecycle state.
+// Payload and Result contain JSON owned by the Job. Lease and lifecycle
+// timestamps capture the current execution, while attempt and failure fields
+// retain the information needed to decide whether another execution may start.
 type Job struct {
 	ID              JobID
 	TaskType        TaskType
@@ -29,7 +39,10 @@ type Job struct {
 	FailedAt        *time.Time
 }
 
-// New creates a queued job from submitted job data.
+// New validates submitted data and creates a queued Job that becomes claimable
+// at availableAt. The caller supplies identity and timestamps so creation is
+// deterministic and testable. Payload is defensively copied, timestamps are
+// stored in UTC, and no execution attempt is consumed during submission.
 func New(id JobID, taskType TaskType, payload json.RawMessage, maxAttempts int, createdAt, availableAt time.Time) (Job, error) {
 	if id == "" {
 		return Job{}, errors.New("job ID must not be empty")
@@ -64,7 +77,9 @@ func New(id JobID, taskType TaskType, payload json.RawMessage, maxAttempts int, 
 	}, nil
 }
 
-// RemainingAttempts reports how many execution attempts may still be started.
+// RemainingAttempts reports how many more leased-to-running transitions the
+// attempt budget permits. It clamps exhausted or inconsistent persisted counts
+// to zero so callers never observe an underflowed budget.
 func (j Job) RemainingAttempts() int {
 	if j.AttemptsStarted >= j.MaxAttempts {
 		return 0

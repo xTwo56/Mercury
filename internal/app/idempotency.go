@@ -12,6 +12,11 @@ import (
 	"strings"
 )
 
+// fingerprintSubmission computes the stable identity of caller-controlled
+// submission data. It canonicalizes payload JSON, normalizes availability to a
+// UTC instant, and records whether optional values were absent or explicit.
+// Generated IDs, resolved defaults, and lifecycle fields are deliberately
+// excluded so retries can replay the originally created job.
 func fingerprintSubmission(submission Submission) ([sha256.Size]byte, error) {
 	canonicalPayload, err := canonicalJSON(submission.Payload)
 	if err != nil {
@@ -33,6 +38,8 @@ func fingerprintSubmission(submission Submission) ([sha256.Size]byte, error) {
 	return sha256.Sum256(encoded.Bytes()), nil
 }
 
+// writeFingerprintValue length-prefixes each component so adjacent values
+// cannot produce the same byte stream through delimiter ambiguity.
 func writeFingerprintValue(buffer *bytes.Buffer, name, value string) {
 	buffer.WriteString(name)
 	buffer.WriteByte(':')
@@ -42,8 +49,10 @@ func writeFingerprintValue(buffer *bytes.Buffer, name, value string) {
 	buffer.WriteByte(';')
 }
 
-// canonicalJSON emits valid JSON with sorted object keys.
-// Number normalization makes equivalent forms such as 1, 1.0, and 1e0 equal.
+// canonicalJSON converts one JSON value into a deterministic encoding. Object
+// keys are sorted and numbers are normalized, making formatting, key order, and
+// equivalent forms such as 1, 1.0, and 1e0 irrelevant to idempotency. A second
+// JSON value is rejected rather than silently excluded from the fingerprint.
 func canonicalJSON(payload json.RawMessage) ([]byte, error) {
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.UseNumber()
@@ -62,6 +71,9 @@ func canonicalJSON(payload json.RawMessage) ([]byte, error) {
 	return canonical.Bytes(), nil
 }
 
+// writeCanonicalJSON recursively emits the supported values produced by
+// encoding/json. Arrays retain order because it is semantically meaningful;
+// object members are emitted in lexical key order to avoid map iteration order.
 func writeCanonicalJSON(buffer *bytes.Buffer, value any) error {
 	switch typed := value.(type) {
 	case nil:
@@ -117,6 +129,10 @@ func writeCanonicalJSON(buffer *bytes.Buffer, value any) error {
 	return nil
 }
 
+// normalizeJSONNumber represents a valid JSON number as an integer coefficient
+// and base-10 exponent. Removing insignificant leading and trailing zeroes
+// ensures numerically equivalent JSON spellings have identical fingerprints
+// without converting through a precision-limited floating-point type.
 func normalizeJSONNumber(value string) (string, error) {
 	negative := strings.HasPrefix(value, "-")
 	if negative {

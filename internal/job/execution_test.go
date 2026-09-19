@@ -40,7 +40,7 @@ func TestJobStart(t *testing.T) {
 				}
 				return job
 			},
-			workerID: WorkerID("worker-1"), token: LeaseToken("token-1"), now: startTime.Add(time.Second), wantErr: true,
+			workerID: WorkerID("worker-1"), token: LeaseToken("token-1"), now: startTime.Add(time.Second),
 		},
 		{name: "wrong state", prepare: func(t *testing.T) Job { return newTestJob(t, claimTime, claimTime) }, workerID: WorkerID("worker-1"), token: LeaseToken("token-1"), now: startTime, wantErr: true},
 		{
@@ -86,6 +86,12 @@ func TestJobStart(t *testing.T) {
 
 			if job.State != StateRunning {
 				t.Errorf("Job.State = %q, want %q", job.State, StateRunning)
+			}
+			if before.State == StateRunning {
+				if !reflect.DeepEqual(job, before) {
+					t.Fatal("replayed start changed execution")
+				}
+				return
 			}
 			if job.AttemptsStarted != before.AttemptsStarted+1 {
 				t.Errorf("Job.AttemptsStarted = %d, want %d", job.AttemptsStarted, before.AttemptsStarted+1)

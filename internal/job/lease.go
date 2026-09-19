@@ -5,21 +5,30 @@ import (
 	"time"
 )
 
+// leaseExpiredFailure is stable persisted metadata for system-initiated
+// recovery, distinguishing lost ownership from a task-reported failure.
 const leaseExpiredFailure = "lease expired"
 
 type (
-	WorkerID   string
+	// WorkerID identifies the worker process that owns a lease.
+	WorkerID string
+	// LeaseToken is an opaque credential authenticating one claim attempt.
 	LeaseToken string
 )
 
-// Lease grants a worker temporary ownership of a job.
+// Lease grants one worker temporary, token-authenticated ownership of a job.
+// ExpiresAt is an exclusive boundary: the lease is invalid when now is equal
+// to or later than it.
 type Lease struct {
 	WorkerID  WorkerID
 	Token     LeaseToken
 	ExpiresAt time.Time
 }
 
-// Claim leases an available queued or retry-scheduled job to a worker.
+// Claim leases an available queued or retry-scheduled job to a worker without
+// consuming an attempt. Execution capacity is consumed later by Start. All
+// transition, budget, availability, identity, and expiry checks occur before
+// mutation so a rejected claim leaves the Job unchanged.
 func (j *Job) Claim(workerID WorkerID, token LeaseToken, now, expiresAt time.Time) error {
 	if !CanTransition(j.State, StateLeased) || j.Lease != nil {
 		return errors.New("job cannot transition to leased")
@@ -52,7 +61,10 @@ func (j *Job) Claim(workerID WorkerID, token LeaseToken, now, expiresAt time.Tim
 	return nil
 }
 
-// ValidateLease verifies that a worker holds the job's unexpired lease.
+// ValidateLease verifies that workerID and token identify the current,
+// unexpired leased Job. The expiration check deliberately treats equality as
+// expired, preventing a worker and lease-recovery process from both acting at
+// the boundary.
 func (j Job) ValidateLease(workerID WorkerID, token LeaseToken, now time.Time) error {
 	if j.State != StateLeased || j.Lease == nil {
 		return errors.New("job has no active lease")
@@ -69,8 +81,12 @@ func (j Job) ValidateLease(workerID WorkerID, token LeaseToken, now time.Time) e
 	return nil
 }
 
-// RecoverExpiredLease releases an expired lease and makes the job eligible for
-// execution again when its attempt budget permits.
+// RecoverExpiredLease performs Mercury-initiated recovery without worker
+// credentials after a lease reaches its expiration boundary. A leased Job
+// returns immediately to queued because no attempt began. A running Job records
+// a lease-expiration failure and either schedules retryAt or becomes terminal
+// when its attempt budget is exhausted. Successful recovery clears ownership;
+// validation completes before mutation so failures leave the Job unchanged.
 func (j *Job) RecoverExpiredLease(now, retryAt time.Time) error {
 	if now.IsZero() {
 		return errors.New("current time must not be zero")

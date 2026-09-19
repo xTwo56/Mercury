@@ -1,0 +1,14 @@
+FROM migrate/migrate:v4.18.3 AS migrate
+
+FROM alpine:3.22.1
+
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S mercury \
+    && adduser -S -G mercury mercury
+
+COPY --from=migrate /usr/local/bin/migrate /usr/local/bin/migrate
+COPY --chmod=0555 deploy/migrate-entrypoint.sh /usr/local/bin/mercury-migrate
+COPY --chown=mercury:mercury migrations /migrations
+
+USER mercury:mercury
+ENTRYPOINT ["/usr/local/bin/mercury-migrate"]

@@ -316,7 +316,7 @@ func TestJobRepositoryIntegration(t *testing.T) {
 			}
 		}
 
-		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt)
+		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt, "email")
 		if err != nil {
 			t.Fatalf("ClaimNext() error = %v", err)
 		}
@@ -350,7 +350,7 @@ func TestJobRepositoryIntegration(t *testing.T) {
 			t.Fatalf("Create() error = %v", err)
 		}
 
-		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt)
+		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt, "email")
 		if err != nil {
 			t.Fatalf("ClaimNext() error = %v", err)
 		}
@@ -371,7 +371,7 @@ func TestJobRepositoryIntegration(t *testing.T) {
 			}
 		}
 
-		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt)
+		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt, "email")
 		if err != nil {
 			t.Fatalf("ClaimNext() error = %v", err)
 		}
@@ -392,7 +392,7 @@ func TestJobRepositoryIntegration(t *testing.T) {
 			}
 		}
 
-		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt)
+		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt, "email")
 		if err != nil {
 			t.Fatalf("ClaimNext() error = %v", err)
 		}
@@ -403,7 +403,7 @@ func TestJobRepositoryIntegration(t *testing.T) {
 
 	t.Run("empty queue", func(t *testing.T) {
 		truncateJobs(t)
-		_, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt)
+		_, err := repository.ClaimNext(ctx, job.WorkerID("worker-1"), job.LeaseToken("token-1"), claimNow, claimExpiresAt, "email")
 		if !errors.Is(err, ErrNoJobAvailable) {
 			t.Fatalf("ClaimNext() error = %v, want ErrNoJobAvailable", err)
 		}
@@ -438,7 +438,7 @@ func TestJobRepositoryIntegration(t *testing.T) {
 		results := make(chan claimResult, 2)
 		claim := func(repository *JobRepository, workerID job.WorkerID, token job.LeaseToken) {
 			<-start
-			claimed, err := repository.ClaimNext(ctx, workerID, token, claimNow, claimExpiresAt)
+			claimed, err := repository.ClaimNext(ctx, workerID, token, claimNow, claimExpiresAt, "email")
 			results <- claimResult{job: claimed, err: err}
 		}
 		go claim(repository, job.WorkerID("worker-1"), job.LeaseToken("token-1"))
@@ -531,7 +531,7 @@ func TestJobRepositoryIntegration(t *testing.T) {
 			{name: "wrong token", job: leasableJob("start-wrong-token", job.StateLeased, 0, 3, startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-2"), now: startNow},
 			{name: "expired lease", job: leasableJob("start-expired", job.StateLeased, 0, 3, startNow.Add(-time.Microsecond)), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: startNow},
 			{name: "exact expiry", job: leasableJob("start-at-expiry", job.StateLeased, 0, 3, startNow), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: startNow},
-			{name: "invalid source state", job: leasableJob("start-running", job.StateRunning, 1, 3, startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: startNow},
+			{name: "invalid source state", job: integrationJob("start-queued", createdAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: startNow},
 			{name: "exhausted attempts", job: leasableJob("start-exhausted", job.StateLeased, 3, 3, startLeaseExpiresAt), workerID: job.WorkerID("worker-1"), token: job.LeaseToken("token-1"), now: startNow},
 		}
 
@@ -602,8 +602,8 @@ func TestJobRepositoryIntegration(t *testing.T) {
 				rejections++
 			}
 		}
-		if successes != 1 || rejections != 1 {
-			t.Errorf("concurrent outcomes = %d successes, %d rejections; want 1 and 1", successes, rejections)
+		if successes != 2 || rejections != 0 {
+			t.Errorf("concurrent outcomes = %d successes, %d rejections; want 2 and 0", successes, rejections)
 		}
 
 		persisted, err := repository.GetByID(ctx, leased.ID)
@@ -975,10 +975,10 @@ func TestJobRepositoryIntegration(t *testing.T) {
 		}
 		assertJobEqual(t, persisted, want)
 
-		if _, err := repository.ClaimNext(ctx, job.WorkerID("worker-2"), job.LeaseToken("token-2"), retryAt.Add(-time.Microsecond), retryAt.Add(time.Minute)); !errors.Is(err, ErrNoJobAvailable) {
+		if _, err := repository.ClaimNext(ctx, job.WorkerID("worker-2"), job.LeaseToken("token-2"), retryAt.Add(-time.Microsecond), retryAt.Add(time.Minute), "email"); !errors.Is(err, ErrNoJobAvailable) {
 			t.Fatalf("premature ClaimNext() error = %v, want ErrNoJobAvailable", err)
 		}
-		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-2"), job.LeaseToken("token-2"), retryAt, retryAt.Add(time.Minute))
+		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-2"), job.LeaseToken("token-2"), retryAt, retryAt.Add(time.Minute), "email")
 		if err != nil {
 			t.Fatalf("eligible ClaimNext() error = %v", err)
 		}
@@ -1006,7 +1006,7 @@ func TestJobRepositoryIntegration(t *testing.T) {
 		if failed.AttemptsStarted != 1 || !failed.AvailableAt.Equal(running.AvailableAt) {
 			t.Errorf("terminal failure count/availability = %d/%v, want 1/%v", failed.AttemptsStarted, failed.AvailableAt, running.AvailableAt)
 		}
-		if _, err := repository.ClaimNext(ctx, job.WorkerID("worker-2"), job.LeaseToken("token-2"), retryAt, retryAt.Add(time.Minute)); !errors.Is(err, ErrNoJobAvailable) {
+		if _, err := repository.ClaimNext(ctx, job.WorkerID("worker-2"), job.LeaseToken("token-2"), retryAt, retryAt.Add(time.Minute), "email"); !errors.Is(err, ErrNoJobAvailable) {
 			t.Fatalf("ClaimNext() terminal job error = %v, want ErrNoJobAvailable", err)
 		}
 	})
@@ -1223,14 +1223,14 @@ func TestJobRepositoryIntegration(t *testing.T) {
 			}
 		}
 
-		immediate, err := repository.ClaimNext(ctx, job.WorkerID("worker-2"), job.LeaseToken("token-2"), recoveryRetryAt.Add(-time.Microsecond), recoveryRetryAt.Add(time.Minute))
+		immediate, err := repository.ClaimNext(ctx, job.WorkerID("worker-2"), job.LeaseToken("token-2"), recoveryRetryAt.Add(-time.Microsecond), recoveryRetryAt.Add(time.Minute), "email")
 		if err != nil {
 			t.Fatalf("ClaimNext() immediate recovery error = %v", err)
 		}
 		if immediate.ID != leased.ID {
 			t.Errorf("ClaimNext() before retry ID = %q, want immediately queued %q", immediate.ID, leased.ID)
 		}
-		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-3"), job.LeaseToken("token-3"), recoveryRetryAt, recoveryRetryAt.Add(time.Minute))
+		claimed, err := repository.ClaimNext(ctx, job.WorkerID("worker-3"), job.LeaseToken("token-3"), recoveryRetryAt, recoveryRetryAt.Add(time.Minute), "email")
 		if err != nil {
 			t.Fatalf("ClaimNext() scheduled recovery error = %v", err)
 		}
@@ -1422,6 +1422,9 @@ func TestJobRepositoryIntegration(t *testing.T) {
 		if len(seen) != jobCount {
 			t.Errorf("concurrent recovered count = %d, want %d", len(seen), jobCount)
 		}
+	})
+	t.Run("remote worker protocol", func(t *testing.T) {
+		testRemoteWorkers(t, conn, repository, databaseURL, qualifiedSchema, createdAt.Add(48*time.Hour))
 	})
 }
 

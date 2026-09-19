@@ -13,6 +13,7 @@ import (
 )
 
 const (
+	workerBearerEnvironment        = "MERCURY_WORKER_BEARER_TOKEN"
 	roleEnvironment                = "MERCURY_ROLE"
 	databaseURLEnvironment         = "MERCURY_DATABASE_URL"
 	recoveryIntervalEnvironment    = "MERCURY_RECOVERY_INTERVAL"
@@ -54,6 +55,7 @@ const (
 )
 
 type config struct {
+	WorkerBearerToken       string
 	Role                    runtimeRole
 	DatabaseURL             string
 	RecoveryInterval        time.Duration
@@ -96,6 +98,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		loaded.RecoveryRetryDelay = defaultRecoveryRetryDelay
 	}
 	if role.includesAPI() {
+		loaded.WorkerBearerToken = getenv(workerBearerEnvironment)
 		httpReadTimeout, err := environmentDuration(getenv, httpReadTimeoutEnvironment, defaultHTTPReadTimeout)
 		if err != nil {
 			return config{}, err
@@ -193,6 +196,11 @@ func (configuration config) validate() error {
 	}
 	if configuration.Role.includesScheduler() && (configuration.RecoveryBatchSize <= 0 || configuration.RecoveryBatchSize > postgres.MaxRecoveryBatchSize) {
 		return fmt.Errorf("recovery batch size must be between 1 and %d", postgres.MaxRecoveryBatchSize)
+	}
+	// API authentication is independent of worker ownership. No default credential
+	// exists, and validation errors never echo the configured secret.
+	if configuration.Role.includesAPI() && (strings.TrimSpace(configuration.WorkerBearerToken) == "" || strings.ContainsAny(configuration.WorkerBearerToken, " \t\r\n")) {
+		return errors.New("MERCURY_WORKER_BEARER_TOKEN is required and must contain no whitespace")
 	}
 	if configuration.Role.includesAPI() && strings.TrimSpace(configuration.HTTPListenAddress) == "" {
 		return errors.New("HTTP listen address must not be empty")

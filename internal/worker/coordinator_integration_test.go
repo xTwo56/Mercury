@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/xtwo56/mercury/internal/job"
 	"github.com/xtwo56/mercury/internal/storage/postgres"
 	"github.com/xtwo56/mercury/internal/task"
@@ -50,13 +51,33 @@ func TestCoordinatorPostgreSQLIntegration(t *testing.T) {
 		}
 	}
 
-	repository := postgres.NewJobRepository(conn)
+	// Heartbeat, claiming and recovery can overlap; a pgx.Conn is not safe for
+	// concurrent use. Give this isolated schema the same pooled access as production.
+	poolConfig, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolConfig.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	repository := postgres.NewJobRepository(pool)
 	now := time.Now().UTC()
 	submitted, err := job.New(job.JobID("worker-sleep"), task.SleepTaskType, json.RawMessage(`{"duration_ms":250}`), 1, now, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := repository.Create(ctx, submitted); err != nil {
+		t.Fatal(err)
+	}
+	// An earlier unsupported job must remain untouched by the sleep worker.
+	unsupported, err := job.New("worker-other", "render", json.RawMessage(`{"frame":1}`), 2, now.Add(-time.Minute), now.Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Create(ctx, unsupported); err != nil {
 		t.Fatal(err)
 	}
 	observed := &observedRepository{JobRepository: repository, completed: make(chan struct{}, 1), renewed: make(chan struct{}, 16)}
@@ -110,10 +131,20 @@ func TestCoordinatorPostgreSQLIntegration(t *testing.T) {
 	if persisted.State != job.StateSucceeded || persisted.AttemptsStarted != 1 || persisted.StartedAt == nil || persisted.CompletedAt == nil || persisted.Lease != nil {
 		t.Errorf("persisted lifecycle = %#v", persisted)
 	}
+	untouched, err := repository.GetByID(ctx, unsupported.ID)
+	if err != nil || untouched.State != job.StateQueued || untouched.Lease != nil || untouched.AttemptsStarted != 0 {
+		t.Fatal("built-in worker claimed unsupported work")
+	}
 	if observed.renewalCount.Load() < 2 {
 		t.Errorf("renewal count = %d, want at least 2", observed.renewalCount.Load())
 	}
-	if string(persisted.Result) != `{"duration_ms":250}` {
+	var result struct {
+		DurationMS int `json:"duration_ms"`
+	}
+	if err := json.Unmarshal(persisted.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.DurationMS != 250 {
 		t.Errorf("result = %s", persisted.Result)
 	}
 }
@@ -148,9 +179,9 @@ func integrationMigrationPaths(t *testing.T) []string {
 	if !ok {
 		t.Fatal("resolve path")
 	}
-	paths, err := filepath.Glob(filepath.Join(filepath.Dir(filename), "..", "..", "..", "migrations", "*.up.sql"))
+	paths, err := filepath.Glob(filepath.Join(filepath.Dir(filename), "..", "..", "migrations", "*.up.sql"))
 	if err != nil || len(paths) == 0 {
-		t.Fatalf("find migrations: %v", err)
+		t.Fatalf("find migrations from %q: %v", filename, err)
 	}
 	return paths
 }

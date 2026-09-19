@@ -1,0 +1,13 @@
+using './main.bicep'
+
+param location = 'centralindia'
+param namePrefix = 'mercury-dev'
+param registryName = 'replacewithgloballyuniqueacr'
+param containerAppsEnvironmentName = 'mercury-dev-env'
+param postgresServerName = 'replace-with-globally-unique-pg'
+param postgresDatabaseName = 'mercury'
+param postgresAdministratorLogin = 'mercuryadmin'
+param postgresAdministratorPassword = readEnvironmentVariable('MERCURY_AZURE_POSTGRES_ADMIN_PASSWORD')
+param postgresSkuTier = 'Burstable'
+param postgresSkuName = 'Standard_B1ms'
+param postgresStorageSizeGB = 32

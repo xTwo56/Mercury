@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -89,6 +90,11 @@ func productionDependencies() applicationDependencies {
 			if err != nil {
 				return nil, err
 			}
+			workers := jobapp.NewWorkerService(repository.WithLifecycleClock(time.Now), jobapp.SystemClock{}, worker.RandomTokenGenerator{})
+			handler, err := httpapi.NewWorkerHandler(workers, configuration.WorkerBearerToken, httpapi.NewHandler(jobs))
+			if err != nil {
+				return nil, err
+			}
 			return httpapi.NewServer(httpapi.ServerConfig{
 				ListenAddress:     configuration.HTTPListenAddress,
 				ReadTimeout:       configuration.HTTPReadTimeout,
@@ -96,7 +102,7 @@ func productionDependencies() applicationDependencies {
 				WriteTimeout:      configuration.HTTPWriteTimeout,
 				IdleTimeout:       configuration.HTTPIdleTimeout,
 				ShutdownTimeout:   configuration.HTTPShutdownTimeout,
-			}, httpapi.NewHandler(jobs), logger)
+			}, handler, logger)
 		},
 	}
 }

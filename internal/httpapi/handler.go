@@ -1,4 +1,8 @@
-// Package httpapi exposes Mercury job use cases over HTTP.
+// Package httpapi adapts Mercury's application-level job use cases to HTTP.
+// Handler owns routing, transport validation, error/status mapping, and the
+// public representation of a job; it delegates task validation, job creation,
+// idempotent persistence, and retrieval to JobService. Server owns the network
+// listener and coordinated shutdown without adding business logic.
 package httpapi
 
 import (
@@ -22,23 +26,30 @@ const (
 	maxIdempotencyKeyBytes       = 255
 )
 
-// JobService is the application boundary used by HTTP handlers.
+// JobService is the narrow application boundary required by Handler. Submit
+// returns whether an idempotent request created or replayed a job, while Get
+// returns the current aggregate for inspection. Implementations remain
+// responsible for domain validation and persistence transactions.
 type JobService interface {
 	Submit(context.Context, app.Submission) (app.SubmissionResult, error)
 	Get(context.Context, job.JobID) (job.Job, error)
 }
 
-// Handler serves job submission and inspection endpoints.
+// Handler exposes job submission and inspection through the versioned HTTP
+// routes. It contains no repository or task-registry dependency directly,
+// keeping HTTP concerns separate from application and storage behavior.
 type Handler struct {
 	jobs JobService
 }
 
-// NewHandler constructs the external HTTP handler.
+// NewHandler constructs the external HTTP adapter around jobs.
 func NewHandler(jobs JobService) *Handler {
 	return &Handler{jobs: jobs}
 }
 
-// ServeHTTP routes the minimal versioned jobs API.
+// ServeHTTP dispatches POST /v1/jobs and GET /v1/jobs/{jobID}. It rejects
+// unsupported methods before invoking application logic and deliberately
+// treats malformed or nested job paths as unknown resources.
 func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 	switch {
 	case request.URL.Path == "/v1/jobs":
@@ -70,6 +81,10 @@ type submissionRequest struct {
 	AvailableAt *string         `json:"available_at,omitempty"`
 }
 
+// submit validates the HTTP envelope, converts transport fields into an
+// application Submission, and maps the resulting application errors to stable
+// public responses. Defaults and lifecycle fields are intentionally left to
+// app.JobService so non-HTTP callers receive identical submission semantics.
 func (handler *Handler) submit(response http.ResponseWriter, request *http.Request) {
 	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
@@ -77,6 +92,8 @@ func (handler *Handler) submit(response http.ResponseWriter, request *http.Reque
 		return
 	}
 
+	// Limit the stream before decoding so a syntactically valid oversized body
+	// cannot force unbounded buffering or JSON parsing work.
 	request.Body = http.MaxBytesReader(response, request.Body, maxRequestBodyBytes)
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
@@ -94,6 +111,8 @@ func (handler *Handler) submit(response http.ResponseWriter, request *http.Reque
 		writeError(response, http.StatusBadRequest, "invalid_json", "request body must contain one JSON object")
 		return
 	}
+	// Preserve absence separately from a supplied key: absence creates on every
+	// request, while a supplied key participates in atomic storage deduplication.
 	idempotencyKey, err := requestIdempotencyKey(request)
 	if err != nil {
 		writeError(response, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key is invalid")
@@ -133,6 +152,8 @@ func (handler *Handler) submit(response http.ResponseWriter, request *http.Reque
 	}
 
 	response.Header().Set("Location", "/v1/jobs/"+url.PathEscape(string(created.Job.ID)))
+	// A replay returns the existing job's current representation and is not a
+	// second creation, so it receives 200 rather than 201.
 	status := http.StatusCreated
 	if created.Replayed {
 		status = http.StatusOK
@@ -140,6 +161,9 @@ func (handler *Handler) submit(response http.ResponseWriter, request *http.Reque
 	writeJSON(response, status, publicJob(created.Job))
 }
 
+// requestIdempotencyKey distinguishes an absent key from a present opaque key.
+// Requiring one printable-ASCII header value avoids ambiguous normalization by
+// HTTP intermediaries; case and byte content are otherwise preserved exactly.
 func requestIdempotencyKey(request *http.Request) (*string, error) {
 	values := request.Header.Values("Idempotency-Key")
 	if len(values) == 0 {
@@ -157,6 +181,9 @@ func requestIdempotencyKey(request *http.Request) (*string, error) {
 	return &key, nil
 }
 
+// get retrieves the job's latest durable state and prevents repository error
+// details from crossing the HTTP boundary. Only the application's distinguishable
+// not-found error becomes a 404.
 func (handler *Handler) get(response http.ResponseWriter, request *http.Request, id job.JobID) {
 	loaded, err := handler.jobs.Get(request.Context(), id)
 	if errors.Is(err, app.ErrJobNotFound) {
@@ -170,6 +197,9 @@ func (handler *Handler) get(response http.ResponseWriter, request *http.Request,
 	writeJSON(response, http.StatusOK, publicJob(loaded))
 }
 
+// jobResponse is the public job projection. It includes task and lifecycle
+// information useful to submitters but deliberately omits worker ownership,
+// lease expiration, and lease tokens.
 type jobResponse struct {
 	ID                job.JobID       `json:"id"`
 	TaskType          job.TaskType    `json:"task_type"`
@@ -187,6 +217,8 @@ type jobResponse struct {
 	FailedAt          *time.Time      `json:"failed_at"`
 }
 
+// publicJob projects the domain aggregate into its credential-free HTTP form.
+// Remaining attempts are calculated by the domain rather than duplicated here.
 func publicJob(value job.Job) jobResponse {
 	return jobResponse{
 		ID: value.ID, TaskType: value.TaskType, Payload: value.Payload, State: value.State,
@@ -197,6 +229,7 @@ func publicJob(value job.Job) jobResponse {
 	}
 }
 
+// errorResponse provides one consistent, non-sensitive JSON error envelope.
 type errorResponse struct {
 	Error struct {
 		Code    string `json:"code"`
@@ -204,11 +237,15 @@ type errorResponse struct {
 	} `json:"error"`
 }
 
+// methodNotAllowed writes both the 405 body and the required Allow header so
+// clients can discover the method supported by the matched route.
 func methodNotAllowed(response http.ResponseWriter, allowed string) {
 	response.Header().Set("Allow", allowed)
 	writeError(response, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 }
 
+// writeError converts an internal error classification into the API's stable
+// error envelope. Callers choose safe messages rather than exposing causes.
 func writeError(response http.ResponseWriter, status int, code, message string) {
 	body := errorResponse{}
 	body.Error.Code = code
@@ -216,12 +253,16 @@ func writeError(response http.ResponseWriter, status int, code, message string) 
 	writeJSON(response, status, body)
 }
 
+// writeJSON commits status and serializes body with the API content type.
 func writeJSON(response http.ResponseWriter, status int, body any) {
 	response.Header().Set("Content-Type", "application/json")
 	response.WriteHeader(status)
 	_ = json.NewEncoder(response).Encode(body)
 }
 
+// requireJSONEnd requires EOF after the first decoded object, rejecting a
+// second value or trailing non-whitespace data that Decoder.Decode alone would
+// otherwise leave unread.
 func requireJSONEnd(decoder *json.Decoder) error {
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
