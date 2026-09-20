@@ -91,6 +91,36 @@ func TestHandlerIdempotentSubmission(t *testing.T) {
 	}
 }
 
+func TestHandlerExternalTaskSubmission(t *testing.T) {
+	now := time.Date(2026, time.September, 21, 12, 0, 0, 0, time.UTC)
+	store := &fakeJobStore{}
+	registry := task.NewRegistry(map[job.TaskType]task.Validator{
+		task.SleepTaskType:            task.SleepValidator{},
+		"configured.external.task.v1": task.JSONValidator{},
+	})
+	handler := testHandlerWithRegistry(t, store, now, registry)
+	body := `{"task_type":"configured.external.task.v1","payload":{"opaque":[1,true,null]}}`
+
+	first := performRequestWithIdempotencyKey(handler, body, "external-replay-key")
+	replay := performRequestWithIdempotencyKey(handler, body, "external-replay-key")
+	if first.Code != http.StatusCreated || replay.Code != http.StatusOK {
+		t.Fatalf("first/replay status = %d/%d, want 201/200; bodies=%s / %s", first.Code, replay.Code, first.Body, replay.Body)
+	}
+	if len(store.created) != 1 || store.created[0].TaskType != "configured.external.task.v1" || !bytes.Equal(store.created[0].Payload, json.RawMessage(`{"opaque":[1,true,null]}`)) {
+		t.Fatalf("persisted external job = %#v", store.created)
+	}
+
+	unauthorized := performRequest(handler, http.MethodPost, "/v1/jobs", "application/json", `{"task_type":"not.authorized","payload":{}}`)
+	if unauthorized.Code != http.StatusBadRequest || !strings.Contains(unauthorized.Body.String(), "unsupported_task_type") {
+		t.Errorf("unauthorized response = %d %s", unauthorized.Code, unauthorized.Body.String())
+	}
+
+	invalidSleep := performRequest(handler, http.MethodPost, "/v1/jobs", "application/json", `{"task_type":"sleep","payload":{"duration_ms":0}}`)
+	if invalidSleep.Code != http.StatusBadRequest || !strings.Contains(invalidSleep.Body.String(), "invalid_payload") {
+		t.Errorf("invalid sleep response = %d %s", invalidSleep.Code, invalidSleep.Body.String())
+	}
+}
+
 func TestHandlerSubmissionWithoutIdempotencyAlwaysCreates(t *testing.T) {
 	store := &fakeJobStore{}
 	handler := testHandler(t, store, time.Now().UTC())
@@ -334,6 +364,11 @@ func TestHandlerMissingJobAndMethods(t *testing.T) {
 func testHandler(t *testing.T, store *fakeJobStore, now time.Time) http.Handler {
 	t.Helper()
 	registry := task.NewRegistry(map[job.TaskType]task.Validator{task.SleepTaskType: task.SleepValidator{}})
+	return testHandlerWithRegistry(t, store, now, registry)
+}
+
+func testHandlerWithRegistry(t *testing.T, store *fakeJobStore, now time.Time, registry *task.Registry) http.Handler {
+	t.Helper()
 	service, err := app.NewJobService(store, registry, fixedClock{now: now}, fixedIDGenerator{}, func(err error) bool {
 		return store.notFound != nil && errors.Is(err, store.notFound)
 	}, func(err error) bool { return errors.Is(err, errFakeIdempotencyConflict) })

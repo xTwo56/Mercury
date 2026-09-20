@@ -59,15 +59,10 @@ func productionDependencies() applicationDependencies {
 		},
 		buildWorker: func(db database, configuration config, logger *slog.Logger) (serviceRunner, error) {
 			repository := postgres.NewJobRepository(db)
-			handlers := task.NewHandlerRegistry()
-			sleepHandler, err := task.NewSleepHandler(task.NewSystemTimerFactory())
+			handlers, err := builtInHandlers()
 			if err != nil {
 				return nil, err
 			}
-			if err := handlers.Register(task.SleepTaskType, sleepHandler); err != nil {
-				return nil, err
-			}
-			handlers.Seal()
 			return worker.NewCoordinator(repository, handlers, worker.NewSystemClock(), worker.RandomTokenGenerator{}, logger, worker.Config{
 				WorkerID: configuration.WorkerID, Concurrency: configuration.WorkerConcurrency,
 				PollInterval: configuration.WorkerPollInterval, LeaseDuration: configuration.WorkerLeaseDuration,
@@ -80,9 +75,10 @@ func productionDependencies() applicationDependencies {
 		},
 		buildAPI: func(db database, configuration config, logger *slog.Logger) (serviceRunner, error) {
 			repository := postgres.NewJobRepository(db)
-			registry := task.NewRegistry(map[job.TaskType]task.Validator{
-				task.SleepTaskType: task.SleepValidator{},
-			})
+			registry, err := submissionRegistry(configuration.ExternalTaskTypes)
+			if err != nil {
+				return nil, err
+			}
 			jobs, err := jobapp.NewJobService(repository, registry, jobapp.SystemClock{}, jobapp.RandomIDGenerator{},
 				func(err error) bool { return errors.Is(err, postgres.ErrJobNotFound) },
 				func(err error) bool { return errors.Is(err, postgres.ErrIdempotencyConflict) },
@@ -105,6 +101,36 @@ func productionDependencies() applicationDependencies {
 			}, handler, logger)
 		},
 	}
+}
+
+// submissionRegistry answers “may Mercury accept this task?” Built-in tasks use
+// precise validators, while configured external tasks receive generic JSON
+// validation because their remote handlers own the application contract.
+func submissionRegistry(externalTypes []job.TaskType) (*task.Registry, error) {
+	definitions := map[job.TaskType]task.Validator{task.SleepTaskType: task.SleepValidator{}}
+	for _, taskType := range externalTypes {
+		if _, exists := definitions[taskType]; exists {
+			return nil, fmt.Errorf("external task type %q conflicts with a built-in task", taskType)
+		}
+		definitions[taskType] = task.JSONValidator{}
+	}
+	return task.NewRegistry(definitions), nil
+}
+
+// builtInHandlers answers “what can this process execute?” It intentionally
+// excludes submission-only external task types, so the local worker's filtered
+// claim query can never lease Iris work.
+func builtInHandlers() (*task.HandlerRegistry, error) {
+	handlers := task.NewHandlerRegistry()
+	sleepHandler, err := task.NewSleepHandler(task.NewSystemTimerFactory())
+	if err != nil {
+		return nil, err
+	}
+	if err := handlers.Register(task.SleepTaskType, sleepHandler); err != nil {
+		return nil, err
+	}
+	handlers.Seal()
+	return handlers, nil
 }
 
 func runApplication(ctx context.Context, configuration config, logger *slog.Logger, dependencies applicationDependencies) error {

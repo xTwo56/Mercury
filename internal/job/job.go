@@ -14,7 +14,8 @@ import (
 type (
 	// JobID uniquely identifies a submitted job across Mercury.
 	JobID string
-	// TaskType selects the registered task contract and execution handler.
+	// TaskType selects an accepted submission contract. Execution routing is
+	// resolved independently by local or remote handler registries.
 	TaskType string
 )
 

@@ -14,7 +14,30 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/xtwo56/mercury/internal/job"
+	"github.com/xtwo56/mercury/internal/task"
 )
+
+func TestExternalSubmissionTypesDoNotAlterBuiltInWorkerRouting(t *testing.T) {
+	registry, err := submissionRegistry([]job.TaskType{"webhook.deliver.v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Validate("webhook.deliver.v1", []byte(`{"delivery_id":"delivery-1","run_id":"run-1"}`)); err != nil {
+		t.Fatalf("configured external submission rejected: %v", err)
+	}
+	if err := registry.Validate("unauthorized", []byte(`{}`)); !errors.Is(err, task.ErrUnsupportedType) {
+		t.Fatalf("unauthorized task error = %v, want ErrUnsupportedType", err)
+	}
+
+	handlers, err := builtInHandlers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	supported := handlers.SupportedTypes()
+	if len(supported) != 1 || supported[0] != task.SleepTaskType {
+		t.Fatalf("built-in worker claim types = %v, want only sleep", supported)
+	}
+}
 
 func TestProductionDatabaseIntegration(t *testing.T) {
 	databaseURL := os.Getenv("MERCURY_TEST_DATABASE_URL")

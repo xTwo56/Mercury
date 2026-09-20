@@ -10,6 +10,7 @@ import (
 
 	"github.com/xtwo56/mercury/internal/job"
 	"github.com/xtwo56/mercury/internal/storage/postgres"
+	"github.com/xtwo56/mercury/internal/task"
 )
 
 const (
@@ -29,6 +30,7 @@ const (
 	workerPollIntervalEnvironment  = "MERCURY_WORKER_POLL_INTERVAL"
 	workerLeaseDurationEnvironment = "MERCURY_WORKER_LEASE_DURATION"
 	workerHeartbeatEnvironment     = "MERCURY_WORKER_HEARTBEAT_INTERVAL"
+	externalTaskTypesEnvironment   = "MERCURY_EXTERNAL_TASK_TYPES"
 
 	defaultRecoveryInterval    = time.Minute
 	defaultRecoveryRetryDelay  = time.Minute
@@ -73,6 +75,7 @@ type config struct {
 	WorkerLeaseDuration     time.Duration
 	WorkerRetryDelay        time.Duration
 	WorkerHeartbeatInterval time.Duration
+	ExternalTaskTypes       []job.TaskType
 }
 
 func loadConfig(getenv func(string) string) (config, error) {
@@ -99,6 +102,10 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}
 	if role.includesAPI() {
 		loaded.WorkerBearerToken = getenv(workerBearerEnvironment)
+		loaded.ExternalTaskTypes, err = externalTaskTypes(getenv(externalTaskTypesEnvironment))
+		if err != nil {
+			return config{}, err
+		}
 		httpReadTimeout, err := environmentDuration(getenv, httpReadTimeoutEnvironment, defaultHTTPReadTimeout)
 		if err != nil {
 			return config{}, err
@@ -164,6 +171,52 @@ func loadConfig(getenv func(string) string) (config, error) {
 	return loaded, nil
 }
 
+// externalTaskTypes parses the API admission allowlist. These values authorize
+// submission only; worker routing continues to come from registered handlers.
+func externalTaskTypes(value string) ([]job.TaskType, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	parts := strings.Split(value, ",")
+	if len(parts) > 100 {
+		return nil, fmt.Errorf("%s must contain at most 100 task types", externalTaskTypesEnvironment)
+	}
+	types := make([]job.TaskType, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" || strings.ContainsAny(trimmed, " \t\r\n") {
+			return nil, fmt.Errorf("%s must be a comma-separated list of nonblank task types without whitespace", externalTaskTypesEnvironment)
+		}
+		types = append(types, job.TaskType(trimmed))
+	}
+	if err := validateExternalTaskTypes(types); err != nil {
+		return nil, err
+	}
+	return types, nil
+}
+
+func validateExternalTaskTypes(types []job.TaskType) error {
+	if len(types) > 100 {
+		return fmt.Errorf("%s must contain at most 100 task types", externalTaskTypesEnvironment)
+	}
+	seen := make(map[job.TaskType]struct{}, len(types))
+	for _, taskType := range types {
+		value := string(taskType)
+		if value == "" || value != strings.TrimSpace(value) || strings.ContainsAny(value, " \t\r\n") {
+			return fmt.Errorf("%s must contain nonblank task types without whitespace", externalTaskTypesEnvironment)
+		}
+		if taskType == task.SleepTaskType {
+			return fmt.Errorf("%s must not include built-in task types", externalTaskTypesEnvironment)
+		}
+		if _, exists := seen[taskType]; exists {
+			return fmt.Errorf("%s must not contain duplicate task types", externalTaskTypesEnvironment)
+		}
+		seen[taskType] = struct{}{}
+	}
+	return nil
+}
+
 func parseRole(value string) (runtimeRole, error) {
 	switch role := runtimeRole(strings.ToLower(strings.TrimSpace(value))); role {
 	case "", roleAll:
@@ -204,6 +257,11 @@ func (configuration config) validate() error {
 	}
 	if configuration.Role.includesAPI() && strings.TrimSpace(configuration.HTTPListenAddress) == "" {
 		return errors.New("HTTP listen address must not be empty")
+	}
+	if configuration.Role.includesAPI() {
+		if err := validateExternalTaskTypes(configuration.ExternalTaskTypes); err != nil {
+			return err
+		}
 	}
 	if configuration.Role.includesAPI() && (configuration.HTTPReadTimeout <= 0 || configuration.HTTPReadHeaderTimeout <= 0 || configuration.HTTPWriteTimeout <= 0 || configuration.HTTPIdleTimeout <= 0 || configuration.HTTPShutdownTimeout <= 0) {
 		return errors.New("HTTP server timeouts must be positive")

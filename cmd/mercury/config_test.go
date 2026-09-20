@@ -59,6 +59,7 @@ func TestLoadConfigOverrides(t *testing.T) {
 		httpShutdownTimeoutEnvironment: "6s",
 		workerLeaseDurationEnvironment: "30s",
 		workerHeartbeatEnvironment:     "8s",
+		externalTaskTypesEnvironment:   "webhook.deliver.v1, image.render.v2",
 	}))
 	if err != nil {
 		t.Fatalf("loadConfig() error = %v", err)
@@ -73,6 +74,9 @@ func TestLoadConfigOverrides(t *testing.T) {
 	}
 	if configuration.WorkerLeaseDuration != 30*time.Second || configuration.WorkerHeartbeatInterval != 8*time.Second {
 		t.Errorf("worker timing overrides = %#v", configuration)
+	}
+	if len(configuration.ExternalTaskTypes) != 2 || configuration.ExternalTaskTypes[0] != "webhook.deliver.v1" || configuration.ExternalTaskTypes[1] != "image.render.v2" {
+		t.Errorf("external task types = %v", configuration.ExternalTaskTypes)
 	}
 }
 
@@ -104,6 +108,10 @@ func TestLoadConfigValidation(t *testing.T) {
 		{name: "invalid worker heartbeat", values: map[string]string{databaseURLEnvironment: "postgres://database/db", workerHeartbeatEnvironment: "often"}},
 		{name: "zero worker heartbeat", values: map[string]string{databaseURLEnvironment: "postgres://database/db", workerHeartbeatEnvironment: "0s"}},
 		{name: "heartbeat without margin", values: map[string]string{databaseURLEnvironment: "postgres://database/db", workerLeaseDurationEnvironment: "30s", workerHeartbeatEnvironment: "15s"}},
+		{name: "empty external type", values: map[string]string{databaseURLEnvironment: "postgres://database/db", externalTaskTypesEnvironment: "webhook.deliver.v1,,other"}},
+		{name: "external type whitespace", values: map[string]string{databaseURLEnvironment: "postgres://database/db", externalTaskTypesEnvironment: "webhook.deliver.v1,bad type"}},
+		{name: "duplicate external type", values: map[string]string{databaseURLEnvironment: "postgres://database/db", externalTaskTypesEnvironment: "webhook.deliver.v1,webhook.deliver.v1"}},
+		{name: "built-in as external type", values: map[string]string{databaseURLEnvironment: "postgres://database/db", externalTaskTypesEnvironment: "sleep"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -133,6 +141,7 @@ func TestRoleParsingAndRelevantConfiguration(t *testing.T) {
 				httpReadTimeoutEnvironment:    map[bool]string{true: "bad"}[!role.includesAPI()],
 				recoveryIntervalEnvironment:   map[bool]string{true: "bad"}[!role.includesScheduler()],
 				workerPollIntervalEnvironment: map[bool]string{true: "bad"}[!role.includesWorker()],
+				externalTaskTypesEnvironment:  map[bool]string{true: "bad type"}[!role.includesAPI()],
 			}))
 			if err != nil {
 				t.Fatalf("loadConfig() error = %v", err)
@@ -142,6 +151,9 @@ func TestRoleParsingAndRelevantConfiguration(t *testing.T) {
 			}
 			if !role.includesAPI() && (configuration.HTTPListenAddress != "" || configuration.HTTPReadTimeout != 0) {
 				t.Errorf("excluded API configuration was loaded: %#v", configuration)
+			}
+			if !role.includesAPI() && len(configuration.ExternalTaskTypes) != 0 {
+				t.Errorf("excluded external task configuration was loaded: %#v", configuration)
 			}
 			if !role.includesScheduler() && configuration.RecoveryInterval != 0 {
 				t.Errorf("excluded scheduler configuration was loaded: %#v", configuration)

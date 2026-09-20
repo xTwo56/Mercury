@@ -34,7 +34,10 @@ type Validator interface {
 	Validate(json.RawMessage) error
 }
 
-// Registry maps task types to their submission contracts.
+// Registry maps task types to their submission contracts. A contract decides
+// whether Mercury may accept a job; execution handlers are registered
+// separately so accepting externally executed work cannot make a local worker
+// claim a task it does not understand.
 type Registry struct {
 	definitions map[job.TaskType]Validator
 }
@@ -56,6 +59,20 @@ func (registry *Registry) Validate(taskType job.TaskType, payload json.RawMessag
 	}
 	if err := validator.Validate(payload); err != nil {
 		return fmt.Errorf("%w for %s: %v", ErrInvalidPayload, taskType, err)
+	}
+	return nil
+}
+
+// JSONValidator authorizes an externally executed task without interpreting its
+// application-specific payload. It still requires valid JSON; the HTTP boundary
+// supplies the size limit and job.New repeats generic domain validation.
+type JSONValidator struct{}
+
+// Validate accepts exactly the generic JSON contract understood by Mercury.
+// The external handler remains responsible for versioned payload semantics.
+func (JSONValidator) Validate(payload json.RawMessage) error {
+	if !json.Valid(payload) {
+		return errors.New("payload must contain valid JSON")
 	}
 	return nil
 }

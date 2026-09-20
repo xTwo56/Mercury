@@ -102,8 +102,10 @@ func NewJobService(repository JobRepository, tasks *task.Registry, clock Clock, 
 // existing Job in its current state. Repository and generator errors retain
 // their causes, while invalid domain input is classified as ErrInvalidSubmission.
 func (service *JobService) Submit(ctx context.Context, submission Submission) (SubmissionResult, error) {
-	// Task-specific validation runs before generating an ID or touching storage,
-	// avoiding durable jobs that no registered worker can execute.
+	// Admission validation runs before generating an ID or touching storage. A
+	// built-in contract may validate task fields precisely, while a configured
+	// external contract validates only generic JSON and delegates semantics to
+	// its remote handler.
 	if err := service.tasks.Validate(submission.TaskType, submission.Payload); err != nil {
 		return SubmissionResult{}, err
 	}
