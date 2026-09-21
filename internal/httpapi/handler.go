@@ -40,11 +40,21 @@ type JobService interface {
 // keeping HTTP concerns separate from application and storage behavior.
 type Handler struct {
 	jobs JobService
+	auth bearerAuthenticator
 }
 
-// NewHandler constructs the external HTTP adapter around jobs.
-func NewHandler(jobs JobService) *Handler {
-	return &Handler{jobs: jobs}
+// NewHandler constructs the external HTTP adapter around jobs. The producer
+// credential protects submission only; job inspection retains its existing
+// public behavior and worker lifecycle routes use a separate authenticator.
+func NewHandler(jobs JobService, producerCredential string) (*Handler, error) {
+	if jobs == nil {
+		return nil, errors.New("job HTTP service must not be nil")
+	}
+	auth, err := newBearerAuthenticator("producer", producerCredential)
+	if err != nil {
+		return nil, err
+	}
+	return &Handler{jobs: jobs, auth: auth}, nil
 }
 
 // ServeHTTP dispatches POST /v1/jobs and GET /v1/jobs/{jobID}. It rejects
@@ -55,6 +65,13 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 	case request.URL.Path == "/v1/jobs":
 		if request.Method != http.MethodPost {
 			methodNotAllowed(response, http.MethodPost)
+			return
+		}
+		// Simply: authenticate the producer before reading or validating its job.
+		// Technically: exactly one timing-safely matched bearer value is required
+		// before task validation, ID generation, or idempotent persistence can run.
+		if !handler.auth.authorized(request) {
+			handler.unauthorizedProducer(response)
 			return
 		}
 		handler.submit(response, request)
@@ -72,6 +89,11 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 	default:
 		writeError(response, http.StatusNotFound, "not_found", "resource not found")
 	}
+}
+
+func (handler *Handler) unauthorizedProducer(response http.ResponseWriter) {
+	response.Header().Set("WWW-Authenticate", `Bearer realm="mercury-producers"`)
+	writeError(response, http.StatusUnauthorized, "unauthorized", "producer authentication required")
 }
 
 type submissionRequest struct {

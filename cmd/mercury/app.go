@@ -86,8 +86,12 @@ func productionDependencies() applicationDependencies {
 			if err != nil {
 				return nil, err
 			}
+			producerHandler, err := httpapi.NewHandler(jobs, configuration.ProducerBearerToken)
+			if err != nil {
+				return nil, err
+			}
 			workers := jobapp.NewWorkerService(repository.WithLifecycleClock(time.Now), jobapp.SystemClock{}, worker.RandomTokenGenerator{})
-			handler, err := httpapi.NewWorkerHandler(workers, configuration.WorkerBearerToken, httpapi.NewHandler(jobs))
+			handler, err := httpapi.NewWorkerHandler(workers, configuration.WorkerBearerToken, producerHandler)
 			if err != nil {
 				return nil, err
 			}

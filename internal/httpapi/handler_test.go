@@ -17,6 +17,73 @@ import (
 	"github.com/xtwo56/mercury/internal/task"
 )
 
+const (
+	producerCredential = "producer-test-credential"
+	producerAuth       = "Bearer " + producerCredential
+	workerCredential   = "worker-test-credential"
+)
+
+func TestHandlerProducerAuthentication(t *testing.T) {
+	body := `{"task_type":"sleep","payload":{"duration_ms":1}}`
+	tests := []struct {
+		name   string
+		values []string
+	}{
+		{name: "missing"},
+		{name: "malformed scheme", values: []string{"Basic " + producerCredential}},
+		{name: "missing token", values: []string{"Bearer"}},
+		{name: "extra token", values: []string{"Bearer " + producerCredential + " extra"}},
+		{name: "incorrect", values: []string{"Bearer wrong"}},
+		{name: "worker credential", values: []string{"Bearer " + workerCredential}},
+		{name: "ambiguous", values: []string{producerAuth, producerAuth}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeJobStore{}
+			handler := testHandler(t, store, time.Now().UTC())
+			request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Idempotency-Key", "must-not-be-written")
+			request.Header["Authorization"] = test.values
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusUnauthorized || response.Header().Get("WWW-Authenticate") != `Bearer realm="mercury-producers"` {
+				t.Fatalf("status/challenge = %d/%q", response.Code, response.Header().Get("WWW-Authenticate"))
+			}
+			if len(store.created) != 0 || len(store.idempotent) != 0 {
+				t.Fatalf("unauthorized submission wrote jobs/idempotency = %d/%d", len(store.created), len(store.idempotent))
+			}
+			if strings.Contains(response.Body.String(), producerCredential) || strings.Contains(response.Body.String(), workerCredential) {
+				t.Fatal("authentication response exposed a credential")
+			}
+		})
+	}
+
+	store := &fakeJobStore{}
+	if response := performRequest(testHandler(t, store, time.Now().UTC()), http.MethodPost, "/v1/jobs", "application/json", body); response.Code != http.StatusCreated {
+		t.Fatalf("authenticated status = %d, want 201: %s", response.Code, response.Body.String())
+	}
+	if len(store.created) != 1 {
+		t.Fatalf("authenticated created jobs = %d, want 1", len(store.created))
+	}
+}
+
+func TestHandlerProducerConfiguration(t *testing.T) {
+	store := &fakeJobStore{}
+	service, err := app.NewJobService(store, task.NewRegistry(nil), fixedClock{now: time.Now().UTC()}, fixedIDGenerator{}, func(error) bool { return false }, func(error) bool { return false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range []string{"", " ", "contains space", "line\nbreak", "control\x01"} {
+		if _, err := NewHandler(service, credential); err == nil {
+			t.Fatalf("NewHandler() accepted credential %q", credential)
+		}
+	}
+	if _, err := NewHandler(nil, producerCredential); err == nil {
+		t.Fatal("NewHandler() accepted nil service")
+	}
+}
+
 func TestHandlerSubmitJob(t *testing.T) {
 	now := time.Date(2026, time.August, 24, 12, 0, 0, 0, time.FixedZone("test", 5*60*60+30*60))
 	delayed := now.Add(time.Hour).Format(time.RFC3339)
@@ -162,6 +229,7 @@ func TestHandlerIdempotencyConflictAndKeyValidation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(validBody))
 			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", producerAuth)
 			request.Header["Idempotency-Key"] = tt.values
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, request)
@@ -361,6 +429,21 @@ func TestHandlerMissingJobAndMethods(t *testing.T) {
 	}
 }
 
+func TestHandlerInspectionRetainsCurrentAuthenticationCoverage(t *testing.T) {
+	now := time.Now().UTC()
+	store := &fakeJobStore{loaded: job.Job{
+		ID: "job-1", TaskType: task.SleepTaskType, Payload: json.RawMessage(`{"duration_ms":1}`),
+		State: job.StateQueued, MaxAttempts: 3, CreatedAt: now, AvailableAt: now,
+	}}
+	handler := testHandler(t, store, now)
+	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/job-1", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("unauthenticated inspection status = %d, want 200: %s", response.Code, response.Body.String())
+	}
+}
+
 func testHandler(t *testing.T, store *fakeJobStore, now time.Time) http.Handler {
 	t.Helper()
 	registry := task.NewRegistry(map[job.TaskType]task.Validator{task.SleepTaskType: task.SleepValidator{}})
@@ -375,7 +458,11 @@ func testHandlerWithRegistry(t *testing.T, store *fakeJobStore, now time.Time, r
 	if err != nil {
 		t.Fatalf("NewJobService() error = %v", err)
 	}
-	return NewHandler(service)
+	handler, err := NewHandler(service, producerCredential)
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+	return handler
 }
 
 func performRequest(handler http.Handler, method, path, contentType, body string) *httptest.ResponseRecorder {
@@ -383,6 +470,7 @@ func performRequest(handler http.Handler, method, path, contentType, body string
 	if contentType != "" {
 		request.Header.Set("Content-Type", contentType)
 	}
+	request.Header.Set("Authorization", producerAuth)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response
@@ -392,6 +480,7 @@ func performRequestWithIdempotencyKey(handler http.Handler, body, key string) *h
 	request := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", key)
+	request.Header.Set("Authorization", producerAuth)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response

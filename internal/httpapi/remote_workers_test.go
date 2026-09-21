@@ -112,6 +112,7 @@ func workerRequest(h http.Handler, method, path, body, auth string) *httptest.Re
 }
 
 const workerAuth = "Bearer test-credential"
+const producerOnlyAuth = "Bearer producer-test-credential"
 const ownerBody = `{"worker_id":"worker-1","lease_token":"fence-1"}`
 
 func TestWorkerAuthentication(t *testing.T) {
@@ -130,6 +131,10 @@ func TestWorkerAuthentication(t *testing.T) {
 		}
 	}
 	h, repo, _ := remoteFixture(t)
+	if w := workerRequest(h, "POST", "claim", `{"worker_id":"worker-1","supported_types":["render"]}`, producerOnlyAuth); w.Code != http.StatusUnauthorized || repo.calls != 0 {
+		t.Fatalf("producer credential accessed worker lifecycle: status/calls=%d/%d", w.Code, repo.calls)
+	}
+	h, repo, _ = remoteFixture(t)
 	r := httptest.NewRequest("GET", "/v1/worker/jobs/job-1", nil)
 	r.Header.Add("Authorization", workerAuth)
 	r.Header.Add("Authorization", workerAuth)

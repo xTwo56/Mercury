@@ -310,7 +310,7 @@ func TestRunApplicationPartialConstructionFailureStartsNothing(t *testing.T) {
 }
 
 func validConfig() config {
-	return config{WorkerBearerToken: "test-worker-credential",
+	return config{WorkerBearerToken: "test-worker-credential", ProducerBearerToken: "test-producer-credential",
 		Role:                    roleAll,
 		DatabaseURL:             "postgres://user:secret@database/mercury",
 		RecoveryInterval:        defaultRecoveryInterval,

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +17,7 @@ import (
 
 const (
 	workerBearerEnvironment        = "MERCURY_WORKER_BEARER_TOKEN"
+	producerBearerEnvironment      = "MERCURY_PRODUCER_BEARER_TOKEN"
 	roleEnvironment                = "MERCURY_ROLE"
 	databaseURLEnvironment         = "MERCURY_DATABASE_URL"
 	recoveryIntervalEnvironment    = "MERCURY_RECOVERY_INTERVAL"
@@ -58,6 +61,7 @@ const (
 
 type config struct {
 	WorkerBearerToken       string
+	ProducerBearerToken     string
 	Role                    runtimeRole
 	DatabaseURL             string
 	RecoveryInterval        time.Duration
@@ -102,6 +106,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}
 	if role.includesAPI() {
 		loaded.WorkerBearerToken = getenv(workerBearerEnvironment)
+		loaded.ProducerBearerToken = getenv(producerBearerEnvironment)
 		loaded.ExternalTaskTypes, err = externalTaskTypes(getenv(externalTaskTypesEnvironment))
 		if err != nil {
 			return config{}, err
@@ -250,10 +255,16 @@ func (configuration config) validate() error {
 	if configuration.Role.includesScheduler() && (configuration.RecoveryBatchSize <= 0 || configuration.RecoveryBatchSize > postgres.MaxRecoveryBatchSize) {
 		return fmt.Errorf("recovery batch size must be between 1 and %d", postgres.MaxRecoveryBatchSize)
 	}
-	// API authentication is independent of worker ownership. No default credential
-	// exists, and validation errors never echo the configured secret.
-	if configuration.Role.includesAPI() && (strings.TrimSpace(configuration.WorkerBearerToken) == "" || strings.ContainsAny(configuration.WorkerBearerToken, " \t\r\n")) {
-		return errors.New("MERCURY_WORKER_BEARER_TOKEN is required and must contain no whitespace")
+	// API roles expose two independent trust boundaries. Neither credential has a
+	// default, and validation errors never echo either configured secret.
+	if configuration.Role.includesAPI() && !validConfiguredBearer(configuration.WorkerBearerToken) {
+		return errors.New("MERCURY_WORKER_BEARER_TOKEN is required and must be printable without whitespace")
+	}
+	if configuration.Role.includesAPI() && !validConfiguredBearer(configuration.ProducerBearerToken) {
+		return errors.New("MERCURY_PRODUCER_BEARER_TOKEN is required and must be printable without whitespace")
+	}
+	if configuration.Role.includesAPI() && sameCredential(configuration.WorkerBearerToken, configuration.ProducerBearerToken) {
+		return errors.New("producer and worker bearer credentials must be different")
 	}
 	if configuration.Role.includesAPI() && strings.TrimSpace(configuration.HTTPListenAddress) == "" {
 		return errors.New("HTTP listen address must not be empty")
@@ -279,6 +290,24 @@ func (configuration config) validate() error {
 		return errors.New("worker heartbeat interval must be positive and leave sufficient lease-renewal margin")
 	}
 	return nil
+}
+
+func validConfiguredBearer(value string) bool {
+	if strings.TrimSpace(value) == "" || strings.ContainsAny(value, " \t\r\n") {
+		return false
+	}
+	for _, character := range []byte(value) {
+		if character < 0x21 || character > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+func sameCredential(first, second string) bool {
+	firstDigest := sha256.Sum256([]byte(first))
+	secondDigest := sha256.Sum256([]byte(second))
+	return subtle.ConstantTimeCompare(firstDigest[:], secondDigest[:]) == 1
 }
 
 func defaultWorkerID() job.WorkerID {

@@ -2,8 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -28,22 +26,23 @@ type RemoteWorkers interface {
 }
 
 type workerHandler struct {
-	workers    RemoteWorkers
-	credential [sha256.Size]byte
-	fallback   http.Handler
+	workers  RemoteWorkers
+	auth     bearerAuthenticator
+	fallback http.Handler
 }
 
 // NewWorkerHandler protects the entire worker namespace before decoding requests.
 // Bearer authentication grants API access; worker IDs and fencing tokens only
 // prove ownership of a particular execution. Existing producer routes are delegated.
 func NewWorkerHandler(workers RemoteWorkers, credential string, fallback http.Handler) (http.Handler, error) {
-	if strings.TrimSpace(credential) == "" || strings.ContainsAny(credential, " \t\r\n") {
-		return nil, errors.New("worker bearer credential must be nonblank and contain no whitespace")
+	auth, err := newBearerAuthenticator("worker", credential)
+	if err != nil {
+		return nil, err
 	}
 	if workers == nil || fallback == nil {
 		return nil, errors.New("worker HTTP dependencies must not be nil")
 	}
-	return &workerHandler{workers: workers, credential: sha256.Sum256([]byte(credential)), fallback: fallback}, nil
+	return &workerHandler{workers: workers, auth: auth, fallback: fallback}, nil
 }
 
 func (h *workerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -53,14 +52,7 @@ func (h *workerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// Never cache lease credentials, and never include them in errors or logs.
 	w.Header().Set("Cache-Control", "no-store")
-	values := r.Header.Values("Authorization")
-	parts := strings.Fields(r.Header.Get("Authorization"))
-	if len(values) != 1 || len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-		h.unauthorized(w)
-		return
-	}
-	supplied := sha256.Sum256([]byte(parts[1]))
-	if subtle.ConstantTimeCompare(supplied[:], h.credential[:]) != 1 {
+	if !h.auth.authorized(r) {
 		h.unauthorized(w)
 		return
 	}
@@ -85,7 +77,7 @@ func (h *workerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.respond(w, value, err)
 		return
 	}
-	parts = strings.Split(path, "/")
+	parts := strings.Split(path, "/")
 	if parts[0] == "" || len(parts) > 2 {
 		writeError(w, 404, "not_found", "resource not found")
 		return
